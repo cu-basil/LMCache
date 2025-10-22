@@ -3,6 +3,7 @@ aiofiles
 aiohttp
 awscrt
 cufile-python
+minio
 fastapi
 httpx
 msgspec
