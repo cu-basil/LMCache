@@ -49,26 +49,20 @@ class MinIOConnectorAdapter(ConnectorAdapter):
             endpoint = rest
             bucket = None
 
+        # Get config from extra_config with defaults (matching S3 adapter pattern)
+        extra_config = config.extra_config if config.extra_config is not None else {}
+
         # Override with extra_config if provided
-        if config.extra_config is not None:
-            access_key = config.extra_config.get("minio_access_key", access_key)
-            secret_key = config.extra_config.get("minio_secret_key", secret_key)
-            bucket = config.extra_config.get("minio_bucket", bucket)
-            self.minio_endpoint = config.extra_config.get("minio_endpoint", endpoint)
-            self.minio_part_size = config.extra_config.get("minio_part_size", None)
-            self.minio_max_inflight_reqs = config.extra_config.get(
-                "minio_max_inflight_reqs", 64
-            )
-            self.minio_secure = config.extra_config.get("minio_secure", True)
-            self.minio_region = config.extra_config.get("minio_region", None)
-            self.minio_file_prefix = config.extra_config.get("minio_file_prefix", None)
-        else:
-            self.minio_endpoint = endpoint
-            self.minio_part_size = None
-            self.minio_max_inflight_reqs = 64
-            self.minio_secure = True
-            self.minio_region = None
-            self.minio_file_prefix = None
+        access_key = extra_config.get("minio_access_key", access_key)
+        secret_key = extra_config.get("minio_secret_key", secret_key)
+        bucket = extra_config.get("minio_bucket", bucket)
+        self.minio_endpoint = extra_config.get("minio_endpoint", endpoint)
+        self.minio_max_inflight_reqs = int(
+            extra_config.get("minio_max_inflight_reqs", 64)
+        )
+        self.minio_secure = bool(extra_config.get("minio_secure", True))
+        self.minio_region = extra_config.get("minio_region", None)
+        self.minio_file_prefix = extra_config.get("minio_file_prefix", None)
 
         if not bucket:
             raise ValueError(
@@ -82,6 +76,9 @@ class MinIOConnectorAdapter(ConnectorAdapter):
                 "or in config (minio_access_key, minio_secret_key)"
             )
 
+        if context.metadata is None:
+            raise ValueError("metadata is required for MinIOConnector")
+
         logger.info(f"Creating MinIO connector for endpoint: {self.minio_endpoint}")
 
         return MinIOConnector(
@@ -91,7 +88,6 @@ class MinIOConnectorAdapter(ConnectorAdapter):
             minio_bucket=bucket,
             loop=context.loop,
             local_cpu_backend=context.local_cpu_backend,
-            minio_part_size=self.minio_part_size,
             minio_file_prefix=self.minio_file_prefix,
             minio_max_inflight_reqs=self.minio_max_inflight_reqs,
             minio_secure=self.minio_secure,

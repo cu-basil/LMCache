@@ -48,7 +48,7 @@ def create_test_metadata():
 
 def create_test_key(key_id: int = 0) -> CacheEngineKey:
     """Create a test CacheEngineKey."""
-    return CacheEngineKey("vllm", "test_model", 3, 123, hash(key_id))
+    return CacheEngineKey("vllm", "test_model", 3, 123, hash(key_id), torch.bfloat16)
 
 
 def create_test_memory_obj(shape=(2, 16, 8, 128), dtype=torch.bfloat16) -> MemoryObj:
@@ -186,9 +186,13 @@ class TestMinIOConnector:
         backend, mock_client = remote_backend_with_minio
 
         # Mock stat_object to raise S3Error for non-existent key
+        from unittest.mock import MagicMock
         from minio.error import S3Error
 
-        mock_client.stat_object.side_effect = S3Error("Not found", 404, "NotFound")
+        mock_response = MagicMock()
+        mock_client.stat_object.side_effect = S3Error(
+            mock_response, "NoSuchKey", "Not found", "/test/key", "request-123", "host-123"
+        )
 
         key = create_test_key(1)
         assert not backend.contains(key)
@@ -197,9 +201,13 @@ class TestMinIOConnector:
         """Test get_blocking() when key doesn't exist in MinIO."""
         backend, mock_client = remote_backend_with_minio
 
+        from unittest.mock import MagicMock
         from minio.error import S3Error
 
-        mock_client.stat_object.side_effect = S3Error("Not found", 404, "NotFound")
+        mock_response = MagicMock()
+        mock_client.stat_object.side_effect = S3Error(
+            mock_response, "NoSuchKey", "Not found", "/test/key", "request-123", "host-123"
+        )
 
         key = create_test_key(2)
         result = backend.get_blocking(key)
@@ -338,15 +346,11 @@ class TestMinIOConnector:
         mock_client.bucket_exists.return_value = True
 
         # Access the connector directly
-        connector = backend.connector.connector
-
-        # Run ping in the async loop
-        def run_ping():
-            return asyncio.run(connector.ping())
+        connector = backend.connection
 
         # We need to run this in the event loop thread
         future = asyncio.run_coroutine_threadsafe(
-            connector.ping(), backend._event_loop
+            connector.ping(), backend.loop
         )
         result = future.result(timeout=5.0)
 
@@ -356,14 +360,18 @@ class TestMinIOConnector:
         """Test ping operation failure."""
         backend, mock_client = remote_backend_with_minio
 
+        from unittest.mock import MagicMock
         from minio.error import S3Error
 
-        mock_client.bucket_exists.side_effect = S3Error("Connection failed", 500, "Error")
+        mock_response = MagicMock()
+        mock_client.bucket_exists.side_effect = S3Error(
+            mock_response, "InternalError", "Connection failed", "/bucket", "request-123", "host-123"
+        )
 
-        connector = backend.connector.connector
+        connector = backend.connection
 
         future = asyncio.run_coroutine_threadsafe(
-            connector.ping(), backend._event_loop
+            connector.ping(), backend.loop
         )
         result = future.result(timeout=5.0)
 

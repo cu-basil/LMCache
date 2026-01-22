@@ -96,7 +96,6 @@ class MinIOConnector(RemoteConnector):
         minio_bucket: str,
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
-        minio_part_size: Optional[int],
         minio_file_prefix: Optional[str],
         minio_max_inflight_reqs: int,
         minio_secure: bool = True,
@@ -104,6 +103,9 @@ class MinIOConnector(RemoteConnector):
     ):
         # Initialize base class to set full_chunk_size and other metadata
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
+
+        # Set minio_part_size to full_chunk_size (matching S3 connector pattern)
+        self.minio_part_size = self.full_chunk_size
 
         self.minio_endpoint = minio_endpoint
         self.minio_access_key = minio_access_key
@@ -113,7 +115,6 @@ class MinIOConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
-        self.minio_part_size = minio_part_size
         self.minio_max_inflight_reqs = minio_max_inflight_reqs
         self.minio_secure = minio_secure
         self.minio_region = minio_region or "us-east-1"
@@ -131,13 +132,13 @@ class MinIOConnector(RemoteConnector):
         # Verify bucket exists or create it
         self._verify_bucket()
 
-        # TODO(Jiayi): Now we only assume MinIO part size = chunk size
-        assert self.minio_part_size == self.full_chunk_size, (
-            "MinIO part size must be equal to chunk size in MinIOConnector"
-        )
-
         # Cache for object sizes to avoid repeated HEAD requests
         self.object_size_cache: dict[str, int] = {}
+
+        # Circuit breaker for connection failures (matching S3 connector pattern)
+        self.connection_failures = 0
+        self.max_connection_failures = 3
+        self.connection_disabled = False
 
         self.inflight_sema = asyncio.Semaphore(minio_max_inflight_reqs)
         self.pq_executor = AsyncPQExecutor(loop)
@@ -153,13 +154,6 @@ class MinIOConnector(RemoteConnector):
 
     def post_init(self):
         logger.info("Post-initializing MinIO connector")
-
-        if self.minio_part_size is None:
-            # Default to chunk size
-            self.minio_part_size = self.full_chunk_size
-        assert self.minio_part_size == self.full_chunk_size, (
-            "MinIO part size must be equal to chunk size in MinIOConnector"
-        )
 
         shm_name_prefix = "minio_shm"
         shms = []
@@ -226,9 +220,13 @@ class MinIOConnector(RemoteConnector):
         )
 
     async def exists(self, key: CacheEngineKey) -> bool:
-        return await self._get_object_size_async(key.to_string()) > 0
+        return self.exists_sync(key)
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
+        # Circuit breaker: if connection is disabled, return False
+        if self.connection_disabled:
+            return False
+
         key_str = key.to_string()
         if key_str in self.object_size_cache:
             return self.object_size_cache[key_str] > 0
@@ -277,6 +275,13 @@ class MinIOConnector(RemoteConnector):
         )
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        # Circuit breaker: if connection is disabled, return None immediately
+        if self.connection_disabled:
+            logger.debug(
+                f"MinIO connection disabled. Skipping download for {key.to_string()}"
+            )
+            return None
+
         key_str = key.to_string()
 
         obj_size = self.object_size_cache.get(key_str, None)
@@ -288,18 +293,27 @@ class MinIOConnector(RemoteConnector):
                 return None
             self.object_size_cache[key_str] = obj_size
 
-        await self.inflight_sema.acquire()
-
         memory_obj = self.local_cpu_backend.allocate(
-            self.meta_shape,
-            self.meta_dtype,
+            self.meta_shapes,
+            self.meta_dtypes,
             self.meta_fmt,
         )
 
-        # TODO(Jiayi): Please support this
-        assert obj_size == memory_obj.get_size(), (
-            "Saving unfull chunk is not supported in MinIOConnector."
-        )
+        if memory_obj is None:
+            return None
+
+        # Check if stored size matches expected size (matching S3 connector pattern)
+        if obj_size != memory_obj.get_size():
+            logger.error(
+                f"Size mismatch for {key_str}: MinIO has {obj_size} bytes, "
+                f"but current config expects {memory_obj.get_size()} bytes. "
+                f"This usually means the data was stored with different chunk_size "
+                f"or model configuration. Please use matching config or clear MinIO."
+            )
+            memory_obj.ref_count_down()
+            return None
+
+        await self.inflight_sema.acquire()
 
         recv_path, shm = self.adhoc_shm_manager.allocate()
 
@@ -314,11 +328,23 @@ class MinIOConnector(RemoteConnector):
 
             self.adhoc_shm_manager.free(recv_path, shm)
 
+            # Reset failure counter on success
+            self._reset_connection_failures()
+
             return memory_obj
         except Exception as e:
-            logger.error(f"Failed to get {key_str} from MinIO: {e}")
+            error_msg = str(e)
+
+            # Update connection failures and check if it's a connection error
+            is_connection_error = self._update_connection_failures(error_msg)
+
+            if not is_connection_error:
+                # Log non-connection errors
+                logger.error(f"Failed to get {key_str} from MinIO: {e}")
+
             self.adhoc_shm_manager.free(recv_path, shm)
-            raise
+            memory_obj.ref_count_down()
+            return None
         finally:
             self.inflight_sema.release()
 
@@ -349,20 +375,28 @@ class MinIOConnector(RemoteConnector):
     async def batched_get(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
+        # Circuit breaker: if connection is disabled, return all None
+        if self.connection_disabled:
+            logger.debug(
+                f"MinIO connection disabled. "
+                f"Skipping batched download for {len(keys)} keys"
+            )
+            return [None] * len(keys)
+
         memory_objs: List[Optional[MemoryObj]] = []
         futures = []
+        future_to_memobj_idx = []
 
         # It is okay for len(keys) > self.minio_max_inflight_reqs
         # but it will be slower.
         if len(keys) > self.minio_max_inflight_reqs:
             logger.warning(
                 f"More keys {len(keys)} to get than "
-                f"max inflight requests {self.minio_max_inflight_reqs}."
+                f"max inflight requests {self.minio_max_inflight_reqs}. "
                 "This will cause slower retrieval."
             )
 
-        # TODO(Jiayi): Need some error handling in this loop.
-        for key in keys:
+        for idx, key in enumerate(keys):
             key_str = key.to_string()
 
             obj_size = self.object_size_cache.get(key_str, None)
@@ -375,24 +409,30 @@ class MinIOConnector(RemoteConnector):
                     continue
                 self.object_size_cache[key_str] = obj_size
 
-            await self.inflight_sema.acquire()
-
             memory_obj = self.local_cpu_backend.allocate(
-                self.meta_shape,
-                self.meta_dtype,
+                self.meta_shapes,
+                self.meta_dtypes,
                 self.meta_fmt,
             )
 
-            memory_objs.append(memory_obj)
-
             if not memory_obj:
-                self.inflight_sema.release()
+                memory_objs.append(None)
                 continue
 
-            # TODO(Jiayi): Please support this
-            assert obj_size == memory_obj.get_size(), (
-                "Saving unfull chunk is not supported in MinIOConnector."
-            )
+            # Check if stored size matches expected size (matching S3 connector pattern)
+            if obj_size != memory_obj.get_size():
+                logger.error(
+                    f"Size mismatch for {key_str}: MinIO has {obj_size} bytes, "
+                    f"but current config expects {memory_obj.get_size()} bytes. "
+                    f"Skipping this key."
+                )
+                memory_obj.ref_count_down()
+                memory_objs.append(None)
+                continue
+
+            memory_objs.append(memory_obj)
+
+            await self.inflight_sema.acquire()
 
             # freeing is done in on_get_done callback
             recv_path, shm = self.adhoc_shm_manager.allocate()
@@ -406,8 +446,37 @@ class MinIOConnector(RemoteConnector):
                 partial(self.on_get_done, obj_size, memory_obj, shm, recv_path)
             )
             futures.append(fut)
+            future_to_memobj_idx.append(len(memory_objs) - 1)
 
-        await asyncio.gather(*futures, return_exceptions=True)
+        # Use return_exceptions to prevent one failure from stopping all downloads
+        results = await asyncio.gather(*futures, return_exceptions=True)
+
+        had_success = False
+
+        for future_idx, result in enumerate(results):
+            memobj_idx = future_to_memobj_idx[future_idx]
+
+            if isinstance(result, Exception):
+                error_msg = str(result)
+
+                is_connection_error = self._update_connection_failures(error_msg)
+
+                if not is_connection_error:
+                    # Log non-connection errors
+                    logger.error(
+                        f"Failed to download key at index {memobj_idx}: {error_msg}"
+                    )
+                # Release the memory object for failed download
+                memobj = memory_objs[memobj_idx]
+                if memobj is not None:
+                    memobj.ref_count_down()
+                    memory_objs[memobj_idx] = None
+            else:
+                had_success = True
+
+        if had_success:
+            self._reset_connection_failures()
+
         return memory_objs
 
     def _minio_upload_sync(
@@ -452,13 +521,24 @@ class MinIOConnector(RemoteConnector):
         """
         Store data to MinIO
         """
+        # Circuit breaker: if connection is disabled, just log and return
+        if self.connection_disabled:
+            logger.debug(
+                f"MinIO connection disabled due to repeated failures. "
+                f"Skipping upload for {key.to_string()}"
+            )
+            return
 
         key_str = key.to_string()
 
-        # TODO(Jiayi): Please support this
-        assert memory_obj.get_physical_size() == self.minio_part_size, (
-            "Saving unfull chunk is not supported in MinIOConnector."
-        )
+        # Check if the chunk size matches expected MinIO part size (matching S3 connector pattern)
+        if memory_obj.get_physical_size() != self.minio_part_size:
+            logger.error(
+                f"Cannot upload {key_str}: chunk size {memory_obj.get_physical_size()} "
+                f"bytes does not match MinIO part size {self.minio_part_size} bytes. "
+                f"Partial/unfull chunks are not supported."
+            )
+            return
 
         await self.inflight_sema.acquire()
         send_path, shm = self.adhoc_shm_manager.allocate()
@@ -477,9 +557,18 @@ class MinIOConnector(RemoteConnector):
 
             self.object_size_cache[key_str] = memory_obj.get_physical_size()
             logger.debug(f"Uploaded {key_str} to MinIO successfully")
+
+            # Reset failure counter on success
+            self._reset_connection_failures()
         except Exception as e:
-            logger.error(f"Failed to upload {key_str} to MinIO: {e}")
-            raise
+            error_msg = str(e)
+
+            # Update connection failures and check if it's a connection error
+            is_connection_error = self._update_connection_failures(error_msg)
+
+            if not is_connection_error:
+                # Log non-connection errors
+                logger.error(f"Failed to upload {key_str} to MinIO: {e}")
         finally:
             self.inflight_sema.release()
             self.adhoc_shm_manager.free(send_path, shm)
@@ -498,6 +587,10 @@ class MinIOConnector(RemoteConnector):
     async def _batched_async_contains(
         self, lookup_id: str, keys: List[CacheEngineKey], pin: bool = False
     ) -> int:
+        # Circuit breaker: if connection is disabled, return 0
+        if self.connection_disabled:
+            return 0
+
         num_hit_counts = 0
         for key in keys:
             key_str = key.to_string()
@@ -576,6 +669,45 @@ class MinIOConnector(RemoteConnector):
 
     def support_batched_get(self) -> bool:
         return True
+
+    def _update_connection_failures(self, error_msg: str) -> bool:
+        """
+        Update connection failure counter and check if it's a connection error.
+        Returns True if it's a connection error, False otherwise.
+        """
+        # Check if it's a connection error
+        is_connection_error = (
+            "CONNECTION_REFUSED" in error_msg
+            or "SOCKET" in error_msg
+            or "DNS" in error_msg
+            or "TIMEOUT" in error_msg
+            or "Connection" in error_msg
+            or "connection" in error_msg
+        )
+
+        if is_connection_error:
+            self.connection_failures += 1
+            logger.error(
+                f"MinIO connection error ({self.connection_failures}/"
+                f"{self.max_connection_failures}): {error_msg}"
+            )
+
+            if self.connection_failures >= self.max_connection_failures:
+                self.connection_disabled = True
+                logger.error(
+                    f"MinIO connection disabled after "
+                    f"{self.max_connection_failures} "
+                    f"consecutive failures. "
+                    f"All future MinIO operations will be skipped."
+                )
+
+        return is_connection_error
+
+    def _reset_connection_failures(self):
+        """Reset connection failure counter on successful operation."""
+        if self.connection_failures > 0:
+            logger.info("MinIO connection recovered")
+            self.connection_failures = 0
 
     async def close(self):
         await self.pq_executor.shutdown(wait=True)
