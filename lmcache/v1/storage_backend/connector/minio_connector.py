@@ -531,14 +531,11 @@ class MinIOConnector(RemoteConnector):
 
         key_str = key.to_string()
 
-        # Check if the chunk size matches expected MinIO part size (matching S3 connector pattern)
-        if memory_obj.get_physical_size() != self.minio_part_size:
-            logger.error(
-                f"Cannot upload {key_str}: chunk size {memory_obj.get_physical_size()} "
-                f"bytes does not match MinIO part size {self.minio_part_size} bytes. "
-                f"Partial/unfull chunks are not supported."
-            )
-            return
+        # Note: MinIO can handle objects of any size. The part_size is only used for
+        # multipart uploads of large objects. Small chunks are uploaded directly.
+        logger.debug(
+            f"Uploading {key_str} to MinIO, size: {memory_obj.get_physical_size()} bytes"
+        )
 
         await self.inflight_sema.acquire()
         send_path, shm = self.adhoc_shm_manager.allocate()
