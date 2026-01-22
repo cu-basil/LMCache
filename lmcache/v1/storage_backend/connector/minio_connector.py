@@ -102,6 +102,9 @@ class MinIOConnector(RemoteConnector):
         minio_secure: bool = True,
         minio_region: Optional[str] = None,
     ):
+        # Initialize base class to set full_chunk_size and other metadata
+        super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
+
         self.minio_endpoint = minio_endpoint
         self.minio_access_key = minio_access_key
         self.minio_secret_key = minio_secret_key
