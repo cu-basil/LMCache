@@ -237,13 +237,26 @@ def CreateStorageBackends(
 
     # Handle remote storage plugins (new way)
     if config.remote_storage_plugins and "RemoteBackend" not in _skip:
+        # ── PESTO Patch Point 1: swap RemoteBackend for PestoRemoteBackend ──────
+        _pesto_enabled = (
+            config.extra_config is not None
+            and config.get_extra_config_value("pesto_enabled", False)
+        )
+        if _pesto_enabled:
+            # Lazy import — zero cost when pesto_enabled is False
+            from lmcache.v1.pesto.pesto_remote_backend import PestoRemoteBackend
+
+            _remote_backend_cls = PestoRemoteBackend
+        else:
+            _remote_backend_cls = RemoteBackend
+        # ── end PESTO patch ─────────────────────────────────────────────────────
         for plugin_name in config.remote_storage_plugins:
             assert local_cpu_backend is not None, (
                 "Remote backend requires local CPU backend as a buffer."
                 "Please turn on local cpu backend with max_local_cpu_size > 0"
             )
             try:
-                remote_backend = RemoteBackend(
+                remote_backend = _remote_backend_cls(
                     config,
                     metadata,
                     loop,
@@ -254,9 +267,35 @@ def CreateStorageBackends(
                 backend_name = "RemoteBackend-%s" % plugin_name
                 storage_backends[backend_name] = remote_backend
                 logger.info(
-                    "Created remote backend for plugin: %s",
+                    "Created %s for plugin: %s",
+                    _remote_backend_cls.__name__,
                     plugin_name,
                 )
+                # ── PESTO Patch Point 1 (continued): inject LocationReporter ──
+                if _pesto_enabled and local_cpu_backend is not None:
+                    try:
+                        from lmcache.v1.pesto.location_reporter import LocationReporter
+                        from lmcache.v1.pesto.metadata_client import create_gms_client
+
+                        _ec = config.extra_config or {}
+                        _gms_client = create_gms_client(config)
+                        _reporter = LocationReporter(
+                            client=_gms_client,
+                            head_id=_ec.get("pesto_gms_instance_id", "default"),
+                            namespace=_ec.get("pesto_gms_instance_id", "default"),
+                            tokenizer_id=_ec.get("pesto_tokenizer_id", "default") or "default",
+                            chat_template_id=_ec.get("pesto_chat_template_id", "default") or "default",
+                            holder_ttl_ms=int(_ec.get("pesto_local_holder_ttl_ms", 5000)),
+                            endpoint=_ec.get("pesto_endpoint", "http://localhost:8000"),
+                        )
+                        _reporter.start(loop)
+                        local_cpu_backend._pesto_reporter = _reporter
+                        logger.info("PESTO LocationReporter injected into LocalCPUBackend")
+                    except Exception as _e:
+                        logger.warning(
+                            "PESTO LocationReporter setup failed (non-fatal): %s", _e
+                        )
+                # ── end PESTO patch ───────────────────────────────────────────
             except Exception as e:
                 logger.error(
                     "Failed to create remote backend for plugin %s: %s",
@@ -271,7 +310,19 @@ def CreateStorageBackends(
             "remote_url is deprecated and will be removed in a future release. "
             "Please use remote_storage_plugins instead."
         )
-        remote_backend = RemoteBackend(
+        # ── PESTO Patch Point 1 (legacy path): same guard ──────────────────────
+        _pesto_enabled_legacy = (
+            config.extra_config is not None
+            and config.get_extra_config_value("pesto_enabled", False)
+        )
+        if _pesto_enabled_legacy:
+            from lmcache.v1.pesto.pesto_remote_backend import PestoRemoteBackend
+
+            _legacy_cls = PestoRemoteBackend
+        else:
+            _legacy_cls = RemoteBackend
+        # ── end PESTO patch ─────────────────────────────────────────────────────
+        remote_backend = _legacy_cls(
             config,
             metadata,
             loop,

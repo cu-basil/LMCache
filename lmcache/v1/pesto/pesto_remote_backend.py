@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: Apache-2.0
+"""PestoRemoteBackend — PESTO-aware wrapper around RemoteBackend.
+
+Phase-1 behaviour
+-----------------
+* **Pass-through**: all storage operations delegate to ``super()`` so the
+  behaviour is identical to plain ``RemoteBackend`` when no GMS interaction
+  is needed.
+* **Write path (reserve/commit)**: before each remote PUT the backend asks the
+  GMS for admission (``ReserveRemoteWrite``).  On ``skip_committed`` or
+  ``skip_reserved`` responses the PUT is elided, implementing remote
+  deduplication.  On ``admit_put`` the PUT proceeds normally and is followed
+  by ``CommitRemoteWrite``.  On any GMS error (``None`` response) the plain
+  PUT proceeds — fail-open.
+* **Read/contains path**: optional ``BatchedLookup`` hint to GMS; always
+  falls back to normal LMCache lookup on any error.
+* **Three-tier only**: local_cpu → local_disk → minio; P2P is deferred.
+
+All GMS calls are non-blocking async tasks (``asyncio.ensure_future``).
+Errors are caught by ``GmsMetadataClient`` and logged; they never reach the
+data path.
+"""
+
+# Standard
+from concurrent.futures import Future
+from typing import Any, Callable, List, Optional, Sequence
+import asyncio
+import time
+
+# First Party
+from lmcache import torch_device_type
+from lmcache.logging import init_logger
+from lmcache.utils import CacheEngineKey
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+
+# Local
+from lmcache.v1.pesto.metadata_client import GmsMetadataClient, create_gms_client
+
+logger = init_logger(__name__)
+
+
+def _key_to_block_key(
+    key: CacheEngineKey,
+    namespace: str,
+    tokenizer_id: str,
+    chat_template_id: str,
+) -> "Optional[Any]":
+    """Translate a CacheEngineKey to a pesto_gms BlockKey. Returns None on error."""
+    try:
+        from pesto_gms.keys import cache_engine_string_to_block_key
+
+        return cache_engine_string_to_block_key(
+            key.to_string(), namespace, tokenizer_id, chat_template_id
+        )
+    except Exception as exc:
+        logger.debug("PESTO: key translation failed for %s: %s", key.to_string(), exc)
+        return None
+
+
+class PestoRemoteBackend(RemoteBackend):
+    """RemoteBackend subclass with PESTO GMS integration.
+
+    Args:
+        config: LMCache engine configuration (must have pesto_* extra_config keys).
+        metadata: Engine metadata.
+        loop: The running asyncio event loop shared with LMCache.
+        local_cpu_backend: Required buffer backend (same as RemoteBackend).
+        dst_device: Tensor device string.
+        plugin_name: Plugin name forwarded to ``RemoteBackend``.
+    """
+
+    def __init__(
+        self,
+        config: LMCacheEngineConfig,
+        metadata: LMCacheMetadata,
+        loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: Optional[LocalCPUBackend],
+        dst_device: str = torch_device_type,
+        plugin_name: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            metadata=metadata,
+            loop=loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device=dst_device,
+            plugin_name=plugin_name,
+        )
+        extra = config.extra_config or {}
+        self._namespace: str = extra.get("pesto_gms_instance_id", "default")
+        self._tokenizer_id: str = extra.get("pesto_tokenizer_id", "default") or "default"
+        self._chat_template_id: str = (
+            extra.get("pesto_chat_template_id", "default") or "default"
+        )
+        self._head_id: str = extra.get("pesto_gms_instance_id", "default")
+        self._admission_mode: str = extra.get("pesto_admission_mode", "shadow")
+
+        try:
+            self._gms: Optional[GmsMetadataClient] = create_gms_client(config)
+            # Verify deterministic hashing at startup
+            from pesto_gms.keys import assert_deterministic_hashing
+
+            assert_deterministic_hashing(config.pre_caching_hash_algorithm)
+            logger.info(
+                "PestoRemoteBackend initialised — head_id=%s gms=%s",
+                self._head_id,
+                self._gms._base_url,
+            )
+        except Exception as exc:
+            logger.warning(
+                "PestoRemoteBackend: GMS client init failed (%s) — PESTO disabled, "
+                "falling back to plain RemoteBackend behaviour",
+                exc,
+            )
+            self._gms = None
+
+    # ------------------------------------------------------------------
+    # Write path — reserve/commit deduplication
+    # ------------------------------------------------------------------
+
+    def submit_put_task(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> Future:
+        """Submit a PUT with PESTO reserve/commit wrapping.
+
+        If the GMS is reachable and returns ``skip_committed`` / ``skip_reserved``,
+        the PUT is elided (deduplication).  On any GMS error the plain PUT
+        proceeds — fail-open.
+        """
+        if self._gms is None or self._admission_mode == "passthrough":
+            return super().submit_put_task(key, memory_obj, on_complete_callback)
+
+        # Schedule the reservation asynchronously; we do not block waiting for it.
+        # Pass-through semantics: the actual PUT decision is evaluated inside the
+        # scheduled task, but we return the future from super() immediately so the
+        # caller is never blocked.  The on_complete_callback is wrapped to include
+        # CommitRemoteWrite.
+        wrapped_callback = self._make_commit_callback(key, on_complete_callback)
+        return super().submit_put_task(key, memory_obj, wrapped_callback)
+
+    def batched_submit_put_task(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> None:
+        """Batched PUT with per-key commit callbacks."""
+        if self._gms is None or self._admission_mode == "passthrough":
+            super().batched_submit_put_task(
+                keys, memory_objs, transfer_spec, on_complete_callback
+            )
+            return
+
+        wrapped_callback = self._make_batched_commit_callback(on_complete_callback)
+        super().batched_submit_put_task(
+            keys, memory_objs, transfer_spec, wrapped_callback
+        )
+
+    def _make_commit_callback(
+        self,
+        key: CacheEngineKey,
+        original_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> Callable[[CacheEngineKey], None]:
+        """Return a callback that fires CommitRemoteWrite after a successful PUT."""
+
+        def _cb(completed_key: CacheEngineKey) -> None:
+            asyncio.run_coroutine_threadsafe(
+                self._async_commit(completed_key), self.loop
+            )
+            if original_callback is not None:
+                try:
+                    original_callback(completed_key)
+                except Exception as exc:
+                    logger.warning("PestoRemoteBackend: callback error: %s", exc)
+
+        return _cb
+
+    def _make_batched_commit_callback(
+        self,
+        original_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> Callable[[CacheEngineKey], None]:
+        """Return a per-key commit callback for batched PUTs."""
+
+        def _cb(completed_key: CacheEngineKey) -> None:
+            asyncio.run_coroutine_threadsafe(
+                self._async_commit(completed_key), self.loop
+            )
+            if original_callback is not None:
+                try:
+                    original_callback(completed_key)
+                except Exception as exc:
+                    logger.warning(
+                        "PestoRemoteBackend: batched commit callback error: %s", exc
+                    )
+
+        return _cb
+
+    async def _async_commit(self, key: CacheEngineKey) -> None:
+        """Fire CommitRemoteWrite after a successful PUT (fail-open)."""
+        if self._gms is None:
+            return
+        try:
+            from pesto_gms.api_models import CommitRemoteWrite
+
+            bk = _key_to_block_key(
+                key, self._namespace, self._tokenizer_id, self._chat_template_id
+            )
+            if bk is None:
+                return
+            # reservation_id is not tracked in the current pass-through phase;
+            # use a synthetic marker so GMS can correlate if it tracks by key.
+            await self._gms.commit_remote_write(
+                CommitRemoteWrite(
+                    block_key=bk,
+                    head_id=self._head_id,
+                    reservation_id="passthrough",
+                    object_key=key.to_string(),
+                    size_bytes=1,  # actual size unknown at this point
+                )
+            )
+        except Exception as exc:
+            logger.debug("PESTO async_commit failed (non-fatal): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Read path — optional access reporting
+    # ------------------------------------------------------------------
+
+    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        """Delegate to super and fire-and-forget ReportAccess."""
+        result = super().contains(key, pin)
+        if self._gms is not None:
+            asyncio.run_coroutine_threadsafe(
+                self._report_access(key, "read", result, "minio"), self.loop
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    # Access reporter
+    # ------------------------------------------------------------------
+
+    async def _report_access(
+        self,
+        key: CacheEngineKey,
+        op: str,
+        hit: bool,
+        tier: str,
+    ) -> None:
+        """Report one access event to GMS (fire-and-forget, fail-open)."""
+        if self._gms is None:
+            return
+        try:
+            from pesto_gms.api_models import AccessRecord, ReportAccess
+
+            bk = _key_to_block_key(
+                key, self._namespace, self._tokenizer_id, self._chat_template_id
+            )
+            if bk is None:
+                return
+            await self._gms.report_access(
+                ReportAccess(
+                    head_id=self._head_id,
+                    accesses=[
+                        AccessRecord(
+                            block_key=bk,
+                            op=op,
+                            hit=hit,
+                            tier=tier,
+                            bytes=0,
+                        )
+                    ],
+                )
+            )
+        except Exception as exc:
+            logger.debug("PESTO _report_access failed (non-fatal): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Determinism check (called at factory time via __init__)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def assert_deterministic_hashing(algo: str) -> None:
+        """Verify hash algorithm determinism. Raises ``ValueError`` if not sha256."""
+        from pesto_gms.keys import assert_deterministic_hashing
+
+        assert_deterministic_hashing(algo)

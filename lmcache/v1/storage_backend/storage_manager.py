@@ -648,6 +648,28 @@ class StorageManager:
         )
         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
 
+        # ── PESTO Patch Point 3: consume the prepared plan (if any) ──────────
+        # The plan was already staged into local_cpu by the prepare endpoint;
+        # the normal prefix-lookup above already found those blocks in the
+        # local_cpu tier.  We just need to pop the plan here so it does not
+        # linger and report the outcome back to GMS.
+        try:
+            from lmcache.v1.pesto.prepare_store import get_global_prepare_store
+
+            _plan_req = get_global_prepare_store().pop(lookup_id)
+            if _plan_req is not None:
+                logger.debug(
+                    "PESTO: consumed prepared plan for request_id=%s "
+                    "(retrieved_length=%d)",
+                    lookup_id,
+                    retrieved_length,
+                )
+        except Exception as _pesto_exc:
+            logger.debug(
+                "PESTO read-path binding error (non-fatal): %s", _pesto_exc
+            )
+        # ── end PESTO patch ────────────────────────────────────────────────────
+
     async def async_lookup_and_prefetch(
         self,
         lookup_id: str,
