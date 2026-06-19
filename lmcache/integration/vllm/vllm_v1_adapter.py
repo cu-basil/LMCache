@@ -1364,6 +1364,30 @@ class LMCacheConnectorV1Impl:
 
         req_id = request.request_id
 
+        # ── PESTO Gap-1: register alias vllm_id → pesto_gateway_uuid ──────────
+        # If the gateway forwarded a pesto_request_id in extra_body (which vLLM
+        # surfaces as sampling_params.extra_args["pesto_request_id"]), register it
+        # so that PrepareStore.pop(vllm_id) resolves the prepared plan.
+        # Fail-open: any error here is non-fatal; default LMCache behaviour is used.
+        try:
+            _sp = getattr(request, "sampling_params", None)
+            _extra_args = getattr(_sp, "extra_args", None) if _sp is not None else None
+            _pesto_id = _extra_args.get("pesto_request_id") if _extra_args else None
+            if _pesto_id and _pesto_id != req_id:
+                from lmcache.v1.pesto.prepare_store import get_global_prepare_store
+
+                get_global_prepare_store().register_alias(req_id, _pesto_id)
+                logger.debug(
+                    "PESTO: registered alias vllm_id=%s → pesto_id=%s",
+                    req_id,
+                    _pesto_id,
+                )
+        except Exception as _pesto_alias_exc:
+            logger.debug(
+                "PESTO alias registration skipped (non-fatal): %s", _pesto_alias_exc
+            )
+        # ── end PESTO Gap-1 ────────────────────────────────────────────────────
+
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
