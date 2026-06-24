@@ -28,7 +28,6 @@ from lmcache.logging import init_logger
 
 # Local
 from pesto_gms.api_models import (
-    AckResponse,
     BatchedLookupRequest,
     BatchedLookupResponse,
     CommitRemoteWrite,
@@ -105,16 +104,22 @@ class GmsMetadataClient:
     Args:
         gms_url: Base URL of the GMS server, e.g. ``"http://localhost:8500"``.
         timeout_secs: Per-request HTTP timeout in seconds.
+        client: Optional pre-built ``httpx.AsyncClient`` (dependency injection
+            for tests, e.g. an in-process ASGI transport). When supplied, the
+            caller owns its lifecycle and ``close()`` will not close it.
     """
 
     def __init__(
         self,
         gms_url: str,
         timeout_secs: float = _DEFAULT_TIMEOUT,
+        *,
+        client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self._base_url = gms_url.rstrip("/")
         self._timeout = httpx.Timeout(timeout_secs)
-        self._client: Optional[httpx.AsyncClient] = None
+        self._client: Optional[httpx.AsyncClient] = client
+        self._owns_client: bool = client is None
         self._cb = _CircuitBreaker()
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -124,6 +129,7 @@ class GmsMetadataClient:
                 base_url=self._base_url,
                 timeout=self._timeout,
             )
+            self._owns_client = True
         return self._client
 
     async def _post(self, path: str, payload: dict) -> Optional[dict]:
@@ -153,28 +159,28 @@ class GmsMetadataClient:
     async def report_queue_state(self, req: ReportQueueState) -> None:
         """Report vLLM queue metrics to GMS (fire-and-forget)."""
         await self._post(
-            "/api/v1/queue/state",
+            "/api/v1/report/queue-state",
             req.model_dump(),
         )
 
     async def report_block_location(self, req: ReportBlockLocation) -> None:
         """Announce new block locations to GMS (fire-and-forget)."""
         await self._post(
-            "/api/v1/blocks/location",
+            "/api/v1/report/block-location",
             req.model_dump(),
         )
 
     async def report_location_evict(self, req: ReportLocationEvict) -> None:
         """Notify GMS that blocks were evicted from a tier (fire-and-forget)."""
         await self._post(
-            "/api/v1/blocks/evict",
+            "/api/v1/report/location-evict",
             req.model_dump(),
         )
 
     async def report_prefetch_outcome(self, req: ReportPrefetchOutcome) -> None:
         """Report prefetch outcomes for a completed plan (fire-and-forget)."""
         await self._post(
-            "/api/v1/prefetch/outcome",
+            "/api/v1/report/prefetch-outcome",
             req.model_dump(),
         )
 
@@ -187,7 +193,7 @@ class GmsMetadataClient:
             A ``ReserveRemoteWriteResponse`` on success, or ``None`` on error
             (caller should fall back to a plain PUT).
         """
-        raw = await self._post("/api/v1/blocks/reserve", req.model_dump())
+        raw = await self._post("/api/v1/write/reserve", req.model_dump())
         if raw is None:
             return None
         try:
@@ -199,14 +205,14 @@ class GmsMetadataClient:
     async def commit_remote_write(self, req: CommitRemoteWrite) -> None:
         """Confirm a completed MinIO upload against a reservation (fire-and-forget)."""
         await self._post(
-            "/api/v1/blocks/commit",
+            "/api/v1/write/commit",
             req.model_dump(),
         )
 
     async def report_access(self, req: ReportAccess) -> None:
         """Report cache access events to GMS (fire-and-forget)."""
         await self._post(
-            "/api/v1/accesses",
+            "/api/v1/report/access",
             req.model_dump(),
         )
 
@@ -234,7 +240,7 @@ class GmsMetadataClient:
             A ``BatchedLookupResponse`` on success, or ``None`` on error
             (caller should fall back to normal cache lookup).
         """
-        raw = await self._post("/api/v1/blocks/lookup", req.model_dump())
+        raw = await self._post("/api/v1/blocks/batched-lookup", req.model_dump())
         if raw is None:
             return None
         try:
@@ -244,10 +250,14 @@ class GmsMetadataClient:
             return None
 
     async def close(self) -> None:
-        """Close the underlying HTTP connection pool."""
-        if self._client is not None and not self._client.is_closed:
+        """Close the underlying HTTP connection pool (only if self-owned)."""
+        if (
+            self._client is not None
+            and not self._client.is_closed
+            and self._owns_client
+        ):
             await self._client.aclose()
-            self._client = None
+        self._client = None
 
 
 def create_gms_client(

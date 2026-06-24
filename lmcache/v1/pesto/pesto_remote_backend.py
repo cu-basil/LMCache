@@ -22,10 +22,9 @@ data path.
 """
 
 # Standard
+import asyncio
 from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Sequence
-import asyncio
-import time
 
 # First Party
 from lmcache import torch_device_type
@@ -91,12 +90,13 @@ class PestoRemoteBackend(RemoteBackend):
             plugin_name=plugin_name,
         )
         extra = config.extra_config or {}
-        self._namespace: str = extra.get("pesto_gms_instance_id", "default")
-        self._tokenizer_id: str = extra.get("pesto_tokenizer_id", "default") or "default"
-        self._chat_template_id: str = (
-            extra.get("pesto_chat_template_id", "default") or "default"
-        )
-        self._head_id: str = extra.get("pesto_gms_instance_id", "default")
+        from lmcache.v1.pesto.identity import resolve_identity
+
+        _identity = resolve_identity(extra, model_id=metadata.model_name)
+        self._namespace: str = _identity.namespace
+        self._head_id: str = _identity.head_id
+        self._tokenizer_id: str = _identity.tokenizer_id
+        self._chat_template_id: str = _identity.chat_template_id
         self._admission_mode: str = extra.get("pesto_admission_mode", "shadow")
 
         try:

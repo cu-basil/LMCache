@@ -274,23 +274,34 @@ def CreateStorageBackends(
                 # ── PESTO Patch Point 1 (continued): inject LocationReporter ──
                 if _pesto_enabled and local_cpu_backend is not None:
                     try:
+                        from lmcache.v1.pesto.identity import resolve_identity
                         from lmcache.v1.pesto.location_reporter import LocationReporter
                         from lmcache.v1.pesto.metadata_client import create_gms_client
 
                         _ec = config.extra_config or {}
+                        _identity = resolve_identity(
+                            _ec,
+                            model_id=metadata.model_name,
+                        )
                         _gms_client = create_gms_client(config)
                         _reporter = LocationReporter(
                             client=_gms_client,
-                            head_id=_ec.get("pesto_gms_instance_id", "default"),
-                            namespace=_ec.get("pesto_gms_instance_id", "default"),
-                            tokenizer_id=_ec.get("pesto_tokenizer_id", "default") or "default",
-                            chat_template_id=_ec.get("pesto_chat_template_id", "default") or "default",
-                            holder_ttl_ms=int(_ec.get("pesto_local_holder_ttl_ms", 5000)),
-                            endpoint=_ec.get("pesto_endpoint", "http://localhost:8000"),
+                            head_id=_identity.head_id,
+                            namespace=_identity.namespace,
+                            tokenizer_id=_identity.tokenizer_id,
+                            chat_template_id=_identity.chat_template_id,
+                            holder_ttl_ms=int(
+                                _ec.get("pesto_local_holder_ttl_ms", 5000)
+                            ),
+                            endpoint=_identity.endpoint,
                         )
                         _reporter.start(loop)
                         local_cpu_backend._pesto_reporter = _reporter
-                        logger.info("PESTO LocationReporter injected into LocalCPUBackend")
+                        logger.info(
+                            "PESTO LocationReporter injected — head_id=%s namespace=%s",
+                            _identity.head_id,
+                            _identity.namespace,
+                        )
                     except Exception as _e:
                         logger.warning(
                             "PESTO LocationReporter setup failed (non-fatal): %s", _e
