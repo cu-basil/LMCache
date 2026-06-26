@@ -12,7 +12,8 @@ Queue-state reporting (``ReportQueueState``) and ``Heartbeat`` are driven by
 a periodic background loop.  Callers may inject a ``get_queue_state_fn``
 callback; if absent those reports are skipped.
 
-All GMS failures are caught by :class:`~lmcache.v1.pesto.metadata_client.GmsMetadataClient`
+All GMS failures are caught by
+:class:`~lmcache.v1.pesto.metadata_client.GmsMetadataClient`
 and never surface here.
 """
 

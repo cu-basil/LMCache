@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """PestoRemoteBackend — PESTO-aware wrapper around RemoteBackend.
 
-Phase-1 behaviour
------------------
-* **Pass-through**: all storage operations delegate to ``super()`` so the
-  behaviour is identical to plain ``RemoteBackend`` when no GMS interaction
-  is needed.
-* **Write path (reserve/commit)**: before each remote PUT the backend asks the
-  GMS for admission (``ReserveRemoteWrite``).  On ``skip_committed`` or
-  ``skip_reserved`` responses the PUT is elided, implementing remote
-  deduplication.  On ``admit_put`` the PUT proceeds normally and is followed
-  by ``CommitRemoteWrite``.  On any GMS error (``None`` response) the plain
-  PUT proceeds — fail-open.
+MVP behaviour (default ``pesto_admission_mode = "passthrough"``)
+----------------------------------------------------------------
+* **Write path (passthrough)**: ``submit_put_task`` / ``batched_submit_put_task``
+  delegate directly to ``super()`` without any reserve/commit wrapping.  No
+  synthetic ``reservation_id="passthrough"`` / ``size_bytes=1`` commit is fired.
+  MinIO blocks become planner-visible via ``MinIOConnector``'s canonical
+  ``_pesto_report_location`` call after each successful upload.
+
+  Opt-in experimental path: set ``pesto_admission_mode="shadow"`` in
+  ``extra_config`` to re-enable the reserve→commit wrapping.
+
+  TODO(CR-4, post-MVP): implement full reserve→PUT→commit admission + dedup
+  enforcement (``commit-creates-location``).  Deferred per CR-4 / P-8 decision.
+
 * **Read/contains path**: optional ``BatchedLookup`` hint to GMS; always
   falls back to normal LMCache lookup on any error.
 * **Three-tier only**: local_cpu → local_disk → minio; P2P is deferred.
@@ -97,7 +100,10 @@ class PestoRemoteBackend(RemoteBackend):
         self._head_id: str = _identity.head_id
         self._tokenizer_id: str = _identity.tokenizer_id
         self._chat_template_id: str = _identity.chat_template_id
-        self._admission_mode: str = extra.get("pesto_admission_mode", "shadow")
+        # Default is "passthrough": no synthetic reserve/commit fires by default.
+        # TODO(CR-4, post-MVP): change default to "shadow" when full admission is
+        # implemented; "passthrough" is the safe MVP default.
+        self._admission_mode: str = extra.get("pesto_admission_mode", "passthrough")
 
         try:
             self._gms: Optional[GmsMetadataClient] = create_gms_client(config)
@@ -204,7 +210,19 @@ class PestoRemoteBackend(RemoteBackend):
         return _cb
 
     async def _async_commit(self, key: CacheEngineKey) -> None:
-        """Fire CommitRemoteWrite after a successful PUT (fail-open)."""
+        """[DEFERRED] Fire CommitRemoteWrite after a successful PUT (fail-open).
+
+        Only scheduled when ``_admission_mode != "passthrough"`` (i.e. the
+        experimental ``"shadow"`` mode is explicitly opted into via
+        ``pesto_admission_mode`` in ``extra_config``).  With the default
+        ``"passthrough"`` admission mode this method is never called, so no
+        synthetic ``reservation_id="passthrough"`` / ``size_bytes=1`` commit
+        is ever sent to GMS.
+
+        TODO(CR-4, post-MVP): replace the synthetic passthrough markers with a
+        real ``reservation_id`` from a preceding ``reserve_remote_write`` call
+        and the actual ``size_bytes`` from the MinIO upload.
+        """
         if self._gms is None:
             return
         try:
@@ -215,15 +233,13 @@ class PestoRemoteBackend(RemoteBackend):
             )
             if bk is None:
                 return
-            # reservation_id is not tracked in the current pass-through phase;
-            # use a synthetic marker so GMS can correlate if it tracks by key.
             await self._gms.commit_remote_write(
                 CommitRemoteWrite(
                     block_key=bk,
                     head_id=self._head_id,
                     reservation_id="passthrough",
                     object_key=key.to_string(),
-                    size_bytes=1,  # actual size unknown at this point
+                    size_bytes=1,  # TODO(CR-4): replace with actual upload size_bytes
                 )
             )
         except Exception as exc:

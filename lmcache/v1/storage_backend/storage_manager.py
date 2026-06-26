@@ -52,7 +52,61 @@ if TYPE_CHECKING:
         LMCacheAsyncLookupServer,
     )
 
+    # Local (PESTO; imported for type hints only — zero runtime cost when PESTO is off)
+    from pesto_gms.api_models import PrepareRequest, PrefetchOutcome
+
 logger = init_logger(__name__)
+
+
+def _compute_pesto_fetch_outcomes(
+    plan_req: "PrepareRequest",
+    retrieved_length: int,
+    now_ms: float,
+) -> "list[PrefetchOutcome]":
+    """Classify every ``fetch`` action in *plan_req* into a ``PrefetchOutcome``.
+
+    Logic per block:
+
+    * ``late``   — ``now_ms > action.deadline_ms`` (deadline already passed).
+    * ``used``   — ``retrieved_length > 0`` and not late (some prefix was served).
+    * ``wasted`` — ``retrieved_length == 0`` and not late (nothing was retrieved).
+
+    ``local_hit`` and ``recompute`` actions are skipped because they were never
+    staged by the prepare endpoint.
+
+    Args:
+        plan_req: The :class:`~pesto_gms.api_models.PrepareRequest` consumed from
+            ``PrepareStore``.
+        retrieved_length: Token count that ``async_lookup_and_prefetch`` returned
+            to the vLLM scheduler.
+        now_ms: Wall-clock time in milliseconds (``time.time() * 1000``).
+
+    Returns:
+        A (possibly empty) list of :class:`~pesto_gms.api_models.PrefetchOutcome`
+        objects ready to be wrapped in a
+        :class:`~pesto_gms.api_models.ReportPrefetchOutcome`.
+    """
+    # Lazy import — only executes when PESTO is active.
+    from pesto_gms.api_models import PrefetchOutcome  # noqa: PLC0415
+
+    outcomes: list[PrefetchOutcome] = []
+    for action in plan_req.block_actions:
+        if action.action in ("local_hit", "recompute"):
+            continue
+        if action.deadline_ms > 0 and now_ms > action.deadline_ms:
+            status = "late"
+        elif retrieved_length > 0:
+            status = "used"
+        else:
+            status = "wasted"
+        outcomes.append(
+            PrefetchOutcome(
+                block_key=action.block_key,
+                status=status,
+                bytes=0,
+            )
+        )
+    return outcomes
 
 
 # Helper function to get the class name of the backend
@@ -651,23 +705,10 @@ class StorageManager:
         # ── PESTO Patch Point 3: consume the prepared plan (if any) ──────────
         # The plan was already staged into local_cpu by the prepare endpoint;
         # the normal prefix-lookup above already found those blocks in the
-        # local_cpu tier.  We just need to pop the plan here so it does not
-        # linger and report the outcome back to GMS.
-        try:
-            from lmcache.v1.pesto.prepare_store import get_global_prepare_store
-
-            _plan_req = get_global_prepare_store().pop(lookup_id)
-            if _plan_req is not None:
-                logger.debug(
-                    "PESTO: consumed prepared plan for request_id=%s "
-                    "(retrieved_length=%d)",
-                    lookup_id,
-                    retrieved_length,
-                )
-        except Exception as _pesto_exc:
-            logger.debug(
-                "PESTO read-path binding error (non-fatal): %s", _pesto_exc
-            )
+        # local_cpu tier.  Pop the plan, classify per-block outcomes
+        # (used / late / wasted), and fire a ReportPrefetchOutcome RPC to GMS
+        # (fire-and-forget; never blocks or raises into the read path).
+        self._pesto_pop_and_report(lookup_id, retrieved_length)
         # ── end PESTO patch ────────────────────────────────────────────────────
 
     async def async_lookup_and_prefetch(
@@ -809,6 +850,9 @@ class StorageManager:
         if num_total_hit_chunks == 0:
             if self.async_lookup_server is not None:
                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+            # PESTO: still pop and report any prepared plan so it does not linger.
+            # retrieved_length=0 → all fetch actions are classified as wasted/late.
+            self._pesto_pop_and_report(lookup_id, 0)
             return
 
         # gather_with_keys() here make a pair of (key, memory_obj) for each chunk
@@ -1441,3 +1485,101 @@ class StorageManager:
             logger.info("Storage manager thread already stopped")
 
         logger.info("Storage manager closed.")
+
+    # ------------------------------------------------------------------
+    # PESTO private helpers (guarded by pesto_enabled; never raise)
+    # ------------------------------------------------------------------
+
+    def _get_pesto_gms_client(self) -> "Optional[object]":
+        """Return the cached GMS client, creating it on first call.
+
+        Returns ``None`` if PESTO is not enabled or the GMS URL is absent.
+        The client is lazily created once and reused for the lifetime of this
+        :class:`StorageManager` instance.
+
+        Returns:
+            A :class:`~lmcache.v1.pesto.metadata_client.GmsMetadataClient`
+            instance, or ``None`` when PESTO is not configured.
+        """
+        if not hasattr(self, "_pesto_gms_client"):
+            self._pesto_gms_client: Optional[object] = None
+            ec = self.config.extra_config or {}
+            if ec.get("pesto_enabled") and ec.get("pesto_gms_url"):
+                try:
+                    from lmcache.v1.pesto.metadata_client import (  # noqa: PLC0415
+                        create_gms_client,
+                    )
+
+                    self._pesto_gms_client = create_gms_client(self.config)
+                except Exception as exc:
+                    logger.debug(
+                        "PESTO: cannot create GMS client (non-fatal): %s", exc
+                    )
+        return self._pesto_gms_client
+
+    def _pesto_pop_and_report(
+        self,
+        lookup_id: str,
+        retrieved_length: int,
+    ) -> None:
+        """Pop the PESTO prepare plan and schedule a ReportPrefetchOutcome RPC.
+
+        Pops any :class:`~pesto_gms.api_models.PrepareRequest` stored under
+        *lookup_id* from the global
+        :class:`~lmcache.v1.pesto.prepare_store.PrepareStore`,
+        classifies per-block outcomes via :func:`_compute_pesto_fetch_outcomes`,
+        and schedules a fire-and-forget ``report_prefetch_outcome`` call on the
+        storage manager's event loop.
+
+        This is always a no-op when PESTO is disabled or when no plan was stored
+        for *lookup_id*. It never raises.
+
+        Args:
+            lookup_id: The request id used by the LMCache scheduler (== vLLM
+                native id after alias resolution in :class:`PrepareStore`).
+            retrieved_length: Token count returned to the vLLM scheduler.
+        """
+        try:
+            import time as _time  # noqa: PLC0415
+
+            from lmcache.v1.pesto.prepare_store import (  # noqa: PLC0415
+                get_global_prepare_store,
+            )
+
+            plan_req = get_global_prepare_store().pop(lookup_id)
+            if plan_req is None:
+                return
+
+            logger.debug(
+                "PESTO: consumed prepared plan for request_id=%s "
+                "(retrieved_length=%d)",
+                lookup_id,
+                retrieved_length,
+            )
+
+            gms_client = self._get_pesto_gms_client()
+            if gms_client is None:
+                return
+
+            now_ms = _time.time() * 1000.0
+            outcomes = _compute_pesto_fetch_outcomes(plan_req, retrieved_length, now_ms)
+            if not outcomes:
+                return
+
+            from pesto_gms.api_models import ReportPrefetchOutcome  # noqa: PLC0415
+            from lmcache.v1.pesto.metadata_client import (  # noqa: PLC0415
+                fire_and_forget,
+            )
+
+            rpo = ReportPrefetchOutcome(
+                request_id=plan_req.request_id,
+                outcomes=outcomes,
+            )
+            # Schedule the coroutine on the storage manager's event loop so it
+            # runs asynchronously without blocking the current callback/coroutine.
+            asyncio.run_coroutine_threadsafe(
+                fire_and_forget(gms_client.report_prefetch_outcome(rpo)),  # type: ignore[union-attr]
+                self.loop,
+            )
+        except Exception as exc:
+            logger.debug("PESTO read-path outcome error (non-fatal): %s", exc)

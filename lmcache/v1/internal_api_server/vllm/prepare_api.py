@@ -29,17 +29,21 @@ Design notes
     to CR-4/P-7.  We do NOT call sm.get for these because that would fetch
     from the wrong source and report an incorrect hit.
 
-* ``reserved_bytes`` reflects *actual* staged bytes, read from the returned
-  ``MemoryObj.get_size()`` call.  Staging stops when ``local_budget_bytes``
-  is exceeded (if non-zero) or when the deadline is hit.
-* Any per-block parsing/fetch error is caught and logged; the endpoint never
-  raises and always returns ``accepted=True`` for successful PESTO plans.
+* The plan is stored in ``PrepareStore`` **before** the staging task is
+  submitted so that the read-path can find it immediately, even if staging has
+  not completed yet.
+* ``reserved_bytes`` is always ``0`` in the immediate response because actual
+  bytes are staged asynchronously in a thread-pool worker.  The gateway should
+  not rely on this value for admission decisions; use ``accepted=True`` to know
+  the plan was accepted.
+* Staging stops when the deadline is hit or ``local_budget_bytes`` is exhausted.
+* Any per-block parsing/fetch error is caught and logged; staging never raises.
 * This head's id is resolved via :func:`~lmcache.v1.pesto.identity.resolve_identity`
   so it matches the identity contract from CR-2.
 """
 
 # Standard
-import asyncio
+import concurrent.futures
 import time
 from typing import Optional
 
@@ -59,6 +63,124 @@ logger = init_logger(__name__)
 _SUPPORTED_FETCH_TIERS = frozenset({"minio", "local_disk"})
 # Peer tiers that the MVP intentionally skips (P2P deferred to CR-4/P-7).
 _PEER_TIERS = frozenset({"peer_cpu", "peer_disk"})
+
+# Module-level thread pool for background staging.  Using a dedicated pool
+# (rather than the event loop's default executor) ensures the staging tasks
+# are never awaited by the ASGI server on shutdown, so the prepare endpoint
+# truly returns before staging completes.
+_STAGING_POOL: concurrent.futures.ThreadPoolExecutor = (
+    concurrent.futures.ThreadPoolExecutor(
+        max_workers=4,
+        thread_name_prefix="pesto-prepare-bg",
+    )
+)
+
+
+def _stage_blocks_background_sync(
+    sm: object,
+    prep_req: object,
+    this_head_id: str,
+    deadline_epoch_s: float,
+    budget_bytes: int,
+) -> None:
+    """Synchronous staging worker: fetch eligible blocks from disk/MinIO into local_cpu.
+
+    This is the async-prepare contract implementation (WS2 + WS4 shared contract):
+    the function runs in a thread-pool worker submitted via ``run_in_executor``,
+    so staging proceeds concurrently with gateway forwarding, racing the prefill
+    deadline rather than adding serial gateway latency.
+
+    All errors are caught and logged; this function never raises.
+
+    Args:
+        sm: The LMCache storage manager (exposes a synchronous ``get(key)`` API).
+        prep_req: The validated :class:`~pesto_gms.api_models.PrepareRequest`.
+        this_head_id: Resolved head id for peer-source filtering.
+        deadline_epoch_s: Wall-clock deadline (``time.time()`` epoch seconds).
+            Staging stops when ``time.time() >= deadline_epoch_s``.
+        budget_bytes: Maximum bytes to stage (0 = unlimited).
+    """
+    reserved_bytes: int = 0
+
+    for action in prep_req.block_actions:  # type: ignore[attr-defined]
+        # Skip non-fetch actions.
+        if action.action in ("local_hit", "recompute"):
+            continue
+
+        # Respect the deadline.
+        if deadline_epoch_s > 0 and time.time() >= deadline_epoch_s:
+            logger.debug(
+                "PESTO prepare bg: deadline exceeded for request_id=%s after %d bytes",
+                prep_req.request_id,  # type: ignore[attr-defined]
+                reserved_bytes,
+            )
+            break
+
+        # Respect the local budget.
+        if budget_bytes > 0 and reserved_bytes >= budget_bytes:
+            logger.debug(
+                "PESTO prepare bg: budget_bytes=%d reached for request_id=%s",
+                budget_bytes,
+                prep_req.request_id,  # type: ignore[attr-defined]
+            )
+            break
+
+        # Tier / holder dispatch — same rules as the synchronous path.
+        source_tier: str = action.source_tier or ""
+        source_holder: Optional[str] = action.source_holder_id or None
+
+        if source_tier in _PEER_TIERS or (
+            source_holder is not None and source_holder != this_head_id
+        ):
+            logger.info(
+                "PESTO prepare bg: skipping peer-source action "
+                "request_id=%s tier=%r holder=%r this_head=%r (P2P deferred to CR-4)",
+                prep_req.request_id,  # type: ignore[attr-defined]
+                source_tier,
+                source_holder,
+                this_head_id,
+            )
+            continue
+
+        if source_tier not in _SUPPORTED_FETCH_TIERS and source_tier:
+            logger.info(
+                "PESTO prepare bg: unknown source_tier=%r for request_id=%s — skipping",
+                source_tier,
+                prep_req.request_id,  # type: ignore[attr-defined]
+            )
+            continue
+
+        # Parse key and fetch — direct synchronous call (in thread-pool worker).
+        try:
+            from pesto_gms.keys import block_key_to_cache_engine_string  # noqa: PLC0415
+
+            key_str = block_key_to_cache_engine_string(action.block_key)
+            key = parse_cache_key(key_str)
+
+            memory_obj: Optional[object] = sm.get(key)  # type: ignore[attr-defined]
+            if memory_obj is not None:
+                try:
+                    block_bytes: int = memory_obj.get_size()  # type: ignore[attr-defined]
+                except Exception:
+                    block_bytes = 0
+                reserved_bytes += block_bytes
+                try:
+                    memory_obj.ref_count_down()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                logger.debug(
+                    "PESTO prepare bg: staged block tier=%r bytes=%d request_id=%s",
+                    source_tier,
+                    block_bytes,
+                    prep_req.request_id,  # type: ignore[attr-defined]
+                )
+        except Exception as exc:
+            logger.warning(
+                "PESTO prepare bg: error fetching block for request_id=%s: %s — "
+                "skipping this block",
+                prep_req.request_id,  # type: ignore[attr-defined]
+                exc,
+            )
 
 
 def _pesto_enabled(request: Request) -> bool:
@@ -122,7 +244,14 @@ def _get_this_head_id(request: Request) -> str:
     tags=["pesto"],
 )
 async def prepare(request: Request) -> JSONResponse:
-    """Stage KV blocks from remote/disk into local_cpu, bound to a request_id.
+    """Accept a prepare plan, store it, and enqueue background staging.
+
+    Implements the **async-prepare contract** (WS2 + WS4): the endpoint
+    returns as soon as the plan is validated and stored in
+    :class:`~lmcache.v1.pesto.prepare_store.PrepareStore`.  Actual block
+    staging (``sm.get`` fetches) continues in a background asyncio task
+    bounded by ``prep_req.deadline_ms``, racing the prefill deadline instead
+    of adding serial gateway latency.
 
     Accepts a JSON body matching ``pesto_gms.api_models.PrepareRequest``.
     Returns a ``pesto_gms.api_models.PrepareResponse``-shaped JSON object.
@@ -130,7 +259,7 @@ async def prepare(request: Request) -> JSONResponse:
     The endpoint is always present.  When ``pesto_enabled=False`` it returns
     ``{"request_id": ..., "accepted": false, "reserved_bytes": 0}`` immediately.
 
-    Tier dispatch (CR-3):
+    Tier dispatch (CR-3, enforced inside :func:`_stage_blocks_background`):
 
     * ``local_hit`` / ``recompute`` actions are skipped (no staging needed).
     * ``fetch`` from ``minio`` or ``local_disk`` where ``source_holder_id`` is
@@ -138,13 +267,12 @@ async def prepare(request: Request) -> JSONResponse:
     * ``fetch`` from peer tiers or a different holder → skipped with a log
       message; P2P fetch is deferred to CR-4 / P-7.
 
-    ``reserved_bytes`` counts actual bytes staged, as reported by each
-    ``MemoryObj.get_size()`` call.  Staging stops at ``local_budget_bytes``
-    (when non-zero) or at the deadline.
+    ``reserved_bytes`` in the response is always ``0`` because staging has not
+    yet completed when the response is sent.
     """
     # Parse body.
     try:
-        from pesto_gms.api_models import PrepareRequest
+        from pesto_gms.api_models import PrepareRequest  # noqa: PLC0415
 
         body_json = await request.json()
         prep_req = PrepareRequest.model_validate(body_json)
@@ -170,119 +298,21 @@ async def prepare(request: Request) -> JSONResponse:
         )
 
     sm = engine.storage_manager
-    timeout_secs = _get_prepare_timeout_ms(request) / 1000.0
-    deadline = time.monotonic() + timeout_secs
     this_head_id = _get_this_head_id(request)
 
-    reserved_bytes: int = 0
-    budget_bytes: int = prep_req.local_budget_bytes  # 0 means unlimited
-    loop = asyncio.get_event_loop()
+    # Compute staging deadline from the PrepareRequest wall-clock deadline.
+    # Fall back to the per-instance config timeout so staging is always bounded.
+    if prep_req.deadline_ms > 0:
+        deadline_epoch_s = prep_req.deadline_ms / 1000.0
+    else:
+        timeout_secs = _get_prepare_timeout_ms(request) / 1000.0
+        deadline_epoch_s = time.time() + timeout_secs
 
-    for action in prep_req.block_actions:
-        # ── skip non-fetch actions ────────────────────────────────────────────
-        if action.action in ("local_hit", "recompute"):
-            continue
-
-        if time.monotonic() >= deadline:
-            logger.debug(
-                "PESTO prepare: deadline exceeded for request_id=%s after staging "
-                "%d bytes",
-                prep_req.request_id,
-                reserved_bytes,
-            )
-            break
-
-        # ── budget cap ───────────────────────────────────────────────────────
-        if budget_bytes > 0 and reserved_bytes >= budget_bytes:
-            logger.debug(
-                "PESTO prepare: local_budget_bytes=%d reached for request_id=%s",
-                budget_bytes,
-                prep_req.request_id,
-            )
-            break
-
-        # ── tier / holder dispatch ───────────────────────────────────────────
-        source_tier: str = action.source_tier or ""
-        source_holder: Optional[str] = action.source_holder_id or None
-
-        if source_tier in _PEER_TIERS or (
-            source_holder is not None and source_holder != this_head_id
-        ):
-            # P2P fetch (peer tier or foreign holder): deferred to CR-4/P-7.
-            logger.info(
-                "PESTO prepare: skipping peer-source action "
-                "request_id=%s tier=%r holder=%r this_head=%r (P2P deferred to CR-4)",
-                prep_req.request_id,
-                source_tier,
-                source_holder,
-                this_head_id,
-            )
-            continue
-
-        if source_tier not in _SUPPORTED_FETCH_TIERS and source_tier:
-            # Unknown/unsupported tier: log and skip safely.
-            logger.info(
-                "PESTO prepare: unknown source_tier=%r for request_id=%s — skipping",
-                source_tier,
-                prep_req.request_id,
-            )
-            continue
-
-        # ── parse key and fetch ───────────────────────────────────────────────
-        try:
-            from pesto_gms.keys import block_key_to_cache_engine_string
-
-            key_str = block_key_to_cache_engine_string(action.block_key)
-            key = parse_cache_key(key_str)
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-
-            memory_obj: Optional[object] = await asyncio.wait_for(
-                loop.run_in_executor(None, sm.get, key),
-                timeout=max(remaining, 0.01),
-            )
-            if memory_obj is not None:
-                # Read the actual staged bytes from the MemoryObj.
-                try:
-                    block_bytes: int = memory_obj.get_size()  # type: ignore[attr-defined]
-                except Exception:
-                    block_bytes = 0
-                reserved_bytes += block_bytes
-
-                # Release the ref-counted object; write-back to local_cpu has
-                # already happened inside sm.get.
-                try:
-                    memory_obj.ref_count_down()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-
-                logger.debug(
-                    "PESTO prepare: staged block tier=%r bytes=%d request_id=%s",
-                    source_tier,
-                    block_bytes,
-                    prep_req.request_id,
-                )
-
-        except asyncio.TimeoutError:
-            logger.debug(
-                "PESTO prepare: timeout fetching block for request_id=%s",
-                prep_req.request_id,
-            )
-            break
-        except Exception as exc:
-            logger.warning(
-                "PESTO prepare: error fetching block for request_id=%s: %s — "
-                "skipping this block",
-                prep_req.request_id,
-                exc,
-            )
-            # Fail-open: continue with remaining blocks.
-
-    # Store plan so the read-path can find it (Gap-1 alias consumption).
+    # Store plan NOW so the read-path can find it even if staging is slow.
     try:
-        from lmcache.v1.pesto.prepare_store import get_global_prepare_store
+        from lmcache.v1.pesto.prepare_store import (  # noqa: PLC0415
+            get_global_prepare_store,
+        )
 
         get_global_prepare_store().put(prep_req.request_id, prep_req)
     except Exception as exc:
@@ -290,11 +320,31 @@ async def prepare(request: Request) -> JSONResponse:
             "PESTO prepare: failed to store plan (non-fatal): %s", exc
         )
 
+    # Submit staging to the module-level thread pool and return immediately.
+    # Using _STAGING_POOL (not the event loop's default executor) ensures the
+    # ASGI server does not block on this task during shutdown, so the endpoint
+    # truly returns before staging completes even in test environments.
+    fut = _STAGING_POOL.submit(
+        _stage_blocks_background_sync,
+        sm,
+        prep_req,
+        this_head_id,
+        deadline_epoch_s,
+        prep_req.local_budget_bytes,
+    )
+    fut.add_done_callback(
+        lambda f: f.exception()
+        and logger.debug(
+            "PESTO prepare bg: staging thread error (non-fatal): %s", f.exception()
+        )
+    )
+
+    # Return quickly; staging continues in the thread pool.
     return JSONResponse(
         {
             "request_id": prep_req.request_id,
             "accepted": True,
-            "reserved_bytes": reserved_bytes,
+            "reserved_bytes": 0,
         }
     )
 

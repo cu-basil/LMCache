@@ -284,6 +284,14 @@ def CreateStorageBackends(
                             model_id=metadata.model_name,
                         )
                         _gms_client = create_gms_client(config)
+                        # ── WS3: build live queue-state callback ──────────────
+                        # Lazy import — zero cost when pesto_enabled is False.
+                        from lmcache.v1.pesto.queue_stats import (
+                            make_prometheus_queue_state_fn,
+                        )
+
+                        _get_queue_state_fn = make_prometheus_queue_state_fn()
+                        # ── end WS3 ──────────────────────────────────────────
                         _reporter = LocationReporter(
                             client=_gms_client,
                             head_id=_identity.head_id,
@@ -294,6 +302,7 @@ def CreateStorageBackends(
                                 _ec.get("pesto_local_holder_ttl_ms", 5000)
                             ),
                             endpoint=_identity.endpoint,
+                            get_queue_state_fn=_get_queue_state_fn,
                         )
                         _reporter.start(loop)
                         local_cpu_backend._pesto_reporter = _reporter
