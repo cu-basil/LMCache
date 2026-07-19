@@ -21,13 +21,14 @@ Design notes
 
   - ``local_hit`` → skip (block already in local_cpu).
   - ``recompute`` → skip (vLLM recomputes; nothing to stage).
-  - ``fetch`` with ``source_tier`` in ``{"minio", "local_disk"}`` AND
-    (``source_holder_id`` is absent OR equals this head's id) → stage via
-    ``sm.get(key)``, which routes through the local_disk → remote hierarchy.
-  - ``fetch`` from a peer tier (``peer_cpu``, ``peer_disk``) OR from a
-    *different* head's holder → **skip with a clear log**; P2P is deferred
-    to CR-4/P-7.  We do NOT call sm.get for these because that would fetch
-    from the wrong source and report an incorrect hit.
+  - ``fetch`` from ``minio`` → stage via ``sm.get(key)`` regardless of
+    ``source_holder_id`` because MinIO is shared durable storage.  The holder
+    identifies the writer, not a peer-transfer endpoint.
+  - ``fetch`` from ``local_disk`` → stage only when ``source_holder_id`` is
+    absent or equals this head's id.
+  - ``fetch`` from a peer tier (``peer_cpu``, ``peer_disk``), or from another
+    head's non-shared tier, → **skip with a clear log**; P2P is deferred to
+    CR-4/P-7.
 
 * The plan is stored in ``PrepareStore`` **before** the staging task is
   submitted so that the read-path can find it immediately, even if staging has
@@ -129,9 +130,12 @@ def _stage_blocks_background_sync(
         source_tier: str = action.source_tier or ""
         source_holder: Optional[str] = action.source_holder_id or None
 
-        if source_tier in _PEER_TIERS or (
-            source_holder is not None and source_holder != this_head_id
-        ):
+        is_foreign_non_shared_source = (
+            source_tier != "minio"
+            and source_holder is not None
+            and source_holder != this_head_id
+        )
+        if source_tier in _PEER_TIERS or is_foreign_non_shared_source:
             logger.info(
                 "PESTO prepare bg: skipping peer-source action "
                 "request_id=%s tier=%r holder=%r this_head=%r (P2P deferred to CR-4)",
@@ -262,10 +266,12 @@ async def prepare(request: Request) -> JSONResponse:
     Tier dispatch (CR-3, enforced inside :func:`_stage_blocks_background`):
 
     * ``local_hit`` / ``recompute`` actions are skipped (no staging needed).
-    * ``fetch`` from ``minio`` or ``local_disk`` where ``source_holder_id`` is
-      absent or equals this head's id → staged via ``sm.get``.
-    * ``fetch`` from peer tiers or a different holder → skipped with a log
-      message; P2P fetch is deferred to CR-4 / P-7.
+    * ``fetch`` from shared ``minio`` → staged via ``sm.get`` regardless of
+      which head originally wrote the durable object.
+    * ``fetch`` from ``local_disk`` → staged only for this head (or an absent
+      holder id).
+    * ``fetch`` from peer tiers or a different holder's non-shared tier →
+      skipped with a log message; P2P fetch is deferred to CR-4 / P-7.
 
     ``reserved_bytes`` in the response is always ``0`` because staging has not
     yet completed when the response is sent.
