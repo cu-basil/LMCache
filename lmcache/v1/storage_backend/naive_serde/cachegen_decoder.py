@@ -131,7 +131,12 @@ class CacheGenDeserializer(Deserializer):
                 dtype=kv_chunk.dtype,
                 address=-1,
                 phy_size=kv_chunk.numel() * kv_chunk.element_size(),
-                ref_count=-1,  # HACK: avoid mis-free
+                # The deserializer returns one caller-owned reference. This
+                # tensor has no parent allocator, so the normal cleanup path
+                # can safely decrement it to zero without freeing allocator
+                # memory. The former -1 sentinel produced a false double-free
+                # warning on every successful remote CacheGen retrieval.
+                ref_count=1,
                 fmt=MemoryFormat.KV_2LTD,
             ),
             parent_allocator=None,

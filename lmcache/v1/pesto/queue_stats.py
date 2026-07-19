@@ -7,9 +7,11 @@ callable suitable for injection into
 
 Metric sourcing
 ---------------
-**Real** (from ``prometheus_client.REGISTRY`` when vLLM is running). Metric
-names changed across vLLM versions, so each field reads the first present
-candidate (see :data:`_VLLM_METRIC_CANDIDATES`):
+**Real** (from the vLLM API server's ``/metrics`` endpoint, with the local
+``prometheus_client.REGISTRY`` as a fallback). vLLM's API server and LMCache
+engine run in separate processes, so the HTTP scrape is required in production.
+Metric names changed across vLLM versions, so each field reads the first
+present candidate (see :data:`_VLLM_METRIC_CANDIDATES`):
 
 * ``vllm:num_requests_waiting``  → ``num_waiting``
 * ``vllm:num_requests_running``  → ``num_running``
@@ -43,7 +45,9 @@ GPU-free environments; no vLLM dependency is required at import time.
 """
 
 # Standard
+import os
 from typing import Callable, Optional
+from urllib.request import urlopen
 
 # First Party
 from lmcache.logging import init_logger
@@ -153,18 +157,75 @@ def _collect_prometheus_stats() -> dict:
     return result
 
 
+def _collect_http_stats(metrics_url: str, timeout_s: float = 0.25) -> dict:
+    """Scrape tracked vLLM gauges from a Prometheus text endpoint.
+
+    The API server owns vLLM's Prometheus registry while LMCache runs in the
+    engine process. A short localhost HTTP scrape therefore provides the live
+    queue state without coupling LMCache to vLLM internals. Failures return an
+    empty partial result so callers can retain registry/default values.
+    """
+    try:
+        with urlopen(metrics_url, timeout=timeout_s) as response:  # noqa: S310
+            exposition = response.read().decode("utf-8")
+    except Exception as exc:
+        logger.debug(
+            "PESTO queue_stats: failed to scrape %s: %s", metrics_url, exc
+        )
+        return {}
+
+    totals: dict[str, float] = {}
+    candidate_names = {
+        metric_name
+        for candidates in _VLLM_METRIC_CANDIDATES.values()
+        for metric_name in candidates
+    }
+    try:
+        for line in exposition.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            metric_name = fields[0].split("{", 1)[0]
+            if metric_name not in candidate_names:
+                continue
+            totals[metric_name] = totals.get(metric_name, 0.0) + float(fields[1])
+    except (TypeError, ValueError) as exc:
+        logger.debug(
+            "PESTO queue_stats: invalid exposition from %s: %s", metrics_url, exc
+        )
+        return {}
+
+    result: dict = {}
+    for field_name, candidates in _VLLM_METRIC_CANDIDATES.items():
+        value = next(
+            (totals[name] for name in candidates if name in totals),
+            None,
+        )
+        if value is None:
+            continue
+        if field_name == "gpu_cache_usage_perc":
+            result[field_name] = float(max(0.0, min(1.0, value)))
+        else:
+            result[field_name] = int(max(0, round(value)))
+    return result
+
+
 # ---- Public API --------------------------------------------------------------
 
 
 def make_prometheus_queue_state_fn(
     extra_sampler: Optional[Callable[[], dict]] = None,
+    metrics_url: Optional[str] = None,
 ) -> Callable[[], dict]:
     """Return a fail-open callable that samples vLLM queue state for PESTO.
 
-    The returned callable reads vLLM metrics from the Prometheus REGISTRY on
-    every invocation.  Approximated fields (see module docstring) default to
-    zero when exact scheduler data is unavailable.  Any unhandled exception
-    returns :data:`ZEROS_DICT` instead of raising.
+    The returned callable scrapes the vLLM API server and falls back to the
+    local Prometheus REGISTRY on every invocation. Approximated fields (see
+    module docstring) default to zero when exact scheduler data is unavailable.
+    Any unhandled exception returns :data:`ZEROS_DICT` instead of raising.
 
     Args:
         extra_sampler: Optional zero-argument callable returning a partial
@@ -177,6 +238,9 @@ def make_prometheus_queue_state_fn(
             ``queued_prefill_tokens``, ``running_decode_blocks``, and
             ``estimated_wait_ms`` values that are not accessible via
             Prometheus alone.
+        metrics_url: Optional vLLM Prometheus endpoint. Defaults to
+            ``PESTO_VLLM_METRICS_URL``. When unset or unreachable, sampling
+            falls back to the current process's Prometheus registry.
 
     Returns:
         A zero-argument callable ``() -> dict`` returning keyword arguments
@@ -185,7 +249,8 @@ def make_prometheus_queue_state_fn(
 
     Notes:
         **Real** fields: ``num_waiting``, ``num_running``, ``num_swapped``,
-        ``gpu_cache_usage_perc`` — sourced from Prometheus REGISTRY.
+        ``gpu_cache_usage_perc`` — sourced from the vLLM HTTP metrics endpoint
+        or, as a fallback, the current process's Prometheus registry.
 
         **Approximated** fields (GPU-free fallbacks, unless overridden via
         ``extra_sampler``):
@@ -195,24 +260,20 @@ def make_prometheus_queue_state_fn(
         * ``running_decode_blocks`` = 0
         * ``estimated_wait_ms`` = 0
 
-        The Prometheus REGISTRY is only queried lazily at call time, so this
-        function is safe to call when vLLM is not yet running.
+        Both sources are queried lazily at call time, so this function is safe
+        to call before the vLLM API server is ready.
     """
+
+    resolved_metrics_url = metrics_url or os.getenv("PESTO_VLLM_METRICS_URL")
 
     def _sample() -> dict:
         try:
             result = _collect_prometheus_stats()
-
-            # Derive approximated composite fields.
-            num_waiting = result["num_waiting"]
-            num_running = result["num_running"]
-            result["active_requests"] = num_running + num_waiting
-            # queued_prefill_tokens: each waiting request has at least one
-            # pending prefill token.  This is a lower bound; callers with
-            # scheduler access should override via extra_sampler.
-            result["queued_prefill_tokens"] = num_waiting
+            if resolved_metrics_url:
+                result.update(_collect_http_stats(resolved_metrics_url))
 
             # Apply caller-supplied overrides (e.g. exact scheduler values).
+            overridden_keys: set[str] = set()
             if extra_sampler is not None:
                 try:
                     overrides = extra_sampler()
@@ -220,10 +281,22 @@ def make_prometheus_queue_state_fn(
                         for key, value in overrides.items():
                             if key in result:
                                 result[key] = value
+                                overridden_keys.add(key)
                 except Exception as exc:
                     logger.debug(
                         "PESTO queue_stats extra_sampler error (non-fatal): %s", exc
                     )
+
+            # Derive composite fields after source overrides.
+            num_waiting = result["num_waiting"]
+            num_running = result["num_running"]
+            if "active_requests" not in overridden_keys:
+                result["active_requests"] = num_running + num_waiting
+            # queued_prefill_tokens: each waiting request has at least one
+            # pending prefill token. This is a lower bound; callers with
+            # scheduler access can override it explicitly.
+            if "queued_prefill_tokens" not in overridden_keys:
+                result["queued_prefill_tokens"] = num_waiting
 
             return result
 

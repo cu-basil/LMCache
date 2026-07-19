@@ -1366,7 +1366,7 @@ class LMCacheConnectorV1Impl:
 
         # ── PESTO Gap-1: register alias vllm_id → pesto_gateway_uuid ──────────
         # Primary source: sampling_params.extra_args["pesto_request_id"],
-        # forwarded by the gateway in extra_body.
+        # forwarded by the gateway in vLLM 0.11's vllm_xargs wire field.
         # Fallback source (WS3 hardening): X-PESTO-Request-ID header, if the
         # vLLM Request object exposes a headers mapping (not guaranteed for all
         # vLLM versions — accessed via getattr, fail-open if absent).

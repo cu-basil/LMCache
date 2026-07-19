@@ -948,6 +948,16 @@ class LMCacheEngine:
                 onload_time * 1000,
                 tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
             )
+
+            # vLLM 0.11 completes the default read path through synchronous
+            # retrieve(), so consume and report a request-bound PESTO plan
+            # here as well as in StorageManager's asynchronous lookup callback.
+            # PrepareStore.pop() makes the two hook points idempotent.
+            assert self.storage_manager is not None
+            self.storage_manager._pesto_pop_and_report(
+                req_id,
+                int(retrieved_tokens),
+            )
         return ret_mask
 
     @_lmcache_nvtx_annotate
