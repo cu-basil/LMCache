@@ -27,7 +27,13 @@ present candidate (see :data:`_VLLM_METRIC_CANDIDATES`):
   without a GPU runtime reference — see extension point below)
 * ``running_decode_blocks`` = 0 (block-level scheduler access unavailable
   GPU-free; post-MVP extension)
-* ``estimated_wait_ms``     = 0 (requires full scheduler state; post-MVP)
+* ``estimated_wait_ms``     = continuous-batching admission-delay estimate
+  derived from ``gpu_cache_usage_perc`` / ``num_waiting`` / ``num_swapped``
+  (see :func:`_estimate_wait_ms`). Mirrors the admission-delay model used by
+  GMS's ``_ContinuousBatchingQueueEstimator``
+  (``pesto_gms/policies/defaults.py``) so the head's self-report is a
+  genuine second opinion, not a copy — GMS blends the two. The constants
+  below are independently-tunable placeholders (see open-questions Q16).
 
 Extension point
 ---------------
@@ -87,6 +93,46 @@ _VLLM_METRIC_CANDIDATES: dict[str, tuple[str, ...]] = {
     ),
     "num_swapped": ("vllm:num_requests_swapped",),  # V0 only; absent on V1 → 0
 }
+
+# ---- estimated_wait_ms model --------------------------------------------------
+# Continuous-batching admission-delay approximation, independently tunable from
+# (but structurally mirroring) GMS's _ContinuousBatchingQueueEstimator in
+# pesto_gms/policies/defaults.py. Unlike that estimator, this runs per-head with
+# no access to a specific incoming request's token count, so the "queued
+# prefill wait" term uses an assumed average request size instead of an exact
+# one. Placeholder constants pending calibration (open-questions Q16).
+_TPOT_MS: float = 62.6  # decode time-per-output-token
+_AVG_DECODE_TOKENS: int = 256  # assumed average remaining decode length
+_HEADROOM_THRESHOLD: float = 0.85  # gpu_cache_usage_perc below which new requests admit immediately
+_AVG_PREFILL_TOKENS: int = 512  # assumed average prompt length of a queued request
+_PREFILL_THROUGHPUT_TPM: float = 50.0  # tokens/ms (PM-06 calibration)
+
+
+def _estimate_wait_ms(
+    gpu_cache_usage_perc: float,
+    num_waiting: int,
+    num_swapped: int,
+) -> float:
+    """Approximate admission-delay for a new request arriving at this head.
+
+    Headroom regime (KV cache has room and nothing is already queued): a new
+    request joins the next batch iteration immediately, so wait ~= 0.
+    Memory-bound regime: the new request waits for running sequences to free
+    enough KV blocks, approximated as half of an assumed average decode
+    length; any requests already waiting ahead of it add their assumed
+    prefill cost on top.
+    """
+    in_headroom = (
+        gpu_cache_usage_perc < _HEADROOM_THRESHOLD
+        and num_waiting == 0
+        and num_swapped == 0
+    )
+    base_wait_ms = 0.0 if in_headroom else (_AVG_DECODE_TOKENS * 0.5) * _TPOT_MS
+    queue_prefill_wait_ms = (
+        num_waiting * _AVG_PREFILL_TOKENS / _PREFILL_THROUGHPUT_TPM
+    )
+    return max(0.0, base_wait_ms + queue_prefill_wait_ms)
+
 
 # ---- Low-level helpers -------------------------------------------------------
 
@@ -258,7 +304,8 @@ def make_prometheus_queue_state_fn(
         * ``active_requests`` = ``num_running + num_waiting``
         * ``queued_prefill_tokens`` = ``num_waiting`` (lower bound)
         * ``running_decode_blocks`` = 0
-        * ``estimated_wait_ms`` = 0
+        * ``estimated_wait_ms`` = continuous-batching admission-delay
+          estimate, see :func:`_estimate_wait_ms`
 
         Both sources are queried lazily at call time, so this function is safe
         to call before the vLLM API server is ready.
@@ -297,6 +344,10 @@ def make_prometheus_queue_state_fn(
             # scheduler access can override it explicitly.
             if "queued_prefill_tokens" not in overridden_keys:
                 result["queued_prefill_tokens"] = num_waiting
+            if "estimated_wait_ms" not in overridden_keys:
+                result["estimated_wait_ms"] = _estimate_wait_ms(
+                    result["gpu_cache_usage_perc"], num_waiting, result["num_swapped"]
+                )
 
             return result
 

@@ -38,9 +38,14 @@ _HEARTBEAT_INTERVAL_SECS: float = 5.0
 _QUEUE_STATE_INTERVAL_SECS: float = 2.0
 
 # TTL in milliseconds used for ephemeral local-CPU location records sent to GMS.
-# After this deadline GMS will consider the block no longer guaranteed to be present
-# (the head may have evicted it without sending an explicit evict notice).
-_LOCAL_CPU_HOLDER_TTL_MS: int = 5_000
+# This is a safety net for an *undetected* loss (reporter crash/drop) only —
+# real evictions are reported immediately and independently via enqueue_evict
+# (local_cpu_backend.py remove()), which deletes the GMS location right away
+# regardless of this TTL. A resident block is never re-reported to refresh
+# it, so this must comfortably exceed realistic repeat intervals; kept in
+# sync with the yaml default (``pesto_local_holder_ttl_ms``) as a fallback
+# for when that key is absent from extra_config.
+_LOCAL_CPU_HOLDER_TTL_MS: int = 300_000
 
 
 class _LocationEvent:
