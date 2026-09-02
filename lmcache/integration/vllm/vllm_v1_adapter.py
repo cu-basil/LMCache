@@ -1845,11 +1845,27 @@ class LMCacheConnectorV1Impl:
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED:
-            # Notify storage backends of aborted requests
-            assert self.lmcache_engine is not None
-            sm = self.lmcache_engine.storage_manager
-            if sm is not None:
-                sm.cancel_request(request.request_id)
+            # On the scheduler-role connector, `lmcache_engine` is None
+            # whenever `enable_scheduler_bypass_lookup` is disabled --
+            # `get_or_create_lmcache_engine` deliberately skips building an
+            # engine for that role+config combination (the actual engine
+            # lives on the worker-role connector instead). That is expected
+            # steady-state, not an error, so skip the storage-backend abort
+            # notification instead of asserting -- the same guard
+            # `get_kv_events` below already uses for the same reason.
+            if self.lmcache_engine is not None:
+                # Notify storage backends of aborted requests
+                sm = self.lmcache_engine.storage_manager
+                if sm is not None:
+                    sm.cancel_request(request.request_id)
+            else:
+                logger.debug(
+                    "request_finished: scheduler-role connector has no "
+                    "lmcache_engine (enable_scheduler_bypass_lookup is "
+                    "disabled); skipping storage-backend abort "
+                    "notification for request %s.",
+                    request.request_id,
+                )
 
             if self.async_loading:
                 # Cancel any ongoing async lookup and prefetch tasks on workers
