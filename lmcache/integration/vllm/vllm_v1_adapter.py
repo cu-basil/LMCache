@@ -1948,41 +1948,35 @@ class LMCacheConnectorV1Impl:
             self, "_layerwise_save_storers"
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
-        '''
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED:
-            # Notify storage backends of aborted requests
-            assert self.lmcache_engine is not None
-            sm = self.lmcache_engine.storage_manager
-            if sm is not None:
-                sm.cancel_request(request.request_id)
+            # On the scheduler-role connector, `lmcache_engine` is None
+            # whenever `enable_scheduler_bypass_lookup` is disabled --
+            # `get_or_create_lmcache_engine` deliberately skips building an
+            # engine for that role+config combination (the actual engine
+            # lives on the worker-role connector instead). That is expected
+            # steady-state, not an error, so skip the storage-backend abort
+            # notification instead of asserting -- the same guard
+            # `get_kv_events` below already uses for the same reason.
+            if self.lmcache_engine is not None:
+                # Notify storage backends of aborted requests
+                sm = self.lmcache_engine.storage_manager
+                if sm is not None:
+                    sm.cancel_request(request.request_id)
+            else:
+                logger.debug(
+                    "request_finished: scheduler-role connector has no "
+                    "lmcache_engine (enable_scheduler_bypass_lookup is "
+                    "disabled); skipping storage-backend abort "
+                    "notification for request %s.",
+                    request.request_id,
+                )
 
             if self.async_loading:
                 # Cancel any ongoing async lookup and prefetch tasks on workers
                 lookup_id = request.request_id
                 assert self.lookup_client is not None
                 self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
-        '''
-        # Cleanup if request was aborted
-        if request.status == RequestStatus.FINISHED_ABORTED:
-            if self.lmcache_engine is None:
-                logger.warning(
-                    "request_finished: request %s aborted before "
-                    "lmcache_engine was attached; skipping LMCache "
-                    "cleanup for this request.",
-                    request.request_id,
-                )
-            else:
-                # Notify storage backends of aborted requests
-                sm = self.lmcache_engine.storage_manager
-                if sm is not None:
-                    sm.cancel_request(request.request_id)
-
-                if self.async_loading:
-                    # Cancel any ongoing async lookup and prefetch tasks on workers
-                    lookup_id = request.request_id
-                    assert self.lookup_client is not None
-                    self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
 
         params = (
             request.kv_transfer_params
