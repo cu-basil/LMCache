@@ -22,20 +22,40 @@ present candidate (see :data:`_VLLM_METRIC_CANDIDATES`):
 **Approximated** (no GPU / scheduler handle required):
 
 * ``active_requests``       = ``num_running + num_waiting`` (derived)
-* ``queued_prefill_tokens`` = ``num_waiting`` (lower bound; a precise value
-  requires the vLLM scheduler's prefill-token queue, which is not accessible
-  without a GPU runtime reference — see extension point below)
+* ``queued_prefill_tokens`` = ``num_waiting`` (lower bound) unless a source has
+  been registered via :func:`register_queued_prefill_tokens_source` (see
+  below), in which case it is the real sum of remaining (uncomputed) prefill
+  tokens across requests the vLLM scheduler has examined and allocated for —
+  still not a complete queue-wide total (requests still buried behind the
+  scheduler's per-step admission budget aren't visible until it reaches them),
+  but a real token count rather than a request headcount.
 * ``running_decode_blocks`` = 0 (block-level scheduler access unavailable
   GPU-free; post-MVP extension)
-* ``estimated_wait_ms``     = 0 (requires full scheduler state; post-MVP)
+* ``estimated_wait_ms``     = 0 unless the ``vllm:request_queue_time_seconds``
+  Prometheus histogram is present, in which case it's the mean queue time (ms)
+  over all requests that have *already finished* waiting — a lagging,
+  historical statistic, not a live prediction for the request being planned
+  right now (see :func:`_read_prometheus_histogram_mean_ms`).
+* ``request_progress``      = ``{}`` unless a source has been registered via
+  :func:`register_request_progress_source` (see below) — ``{pesto_request_id:
+  num_output_tokens}`` for requests currently running on this head.
 
-Extension point
----------------
+Extension points
+-----------------
 Pass an ``extra_sampler: Callable[[], dict]`` to
 :func:`make_prometheus_queue_state_fn` to override any subset of the above
 fields with exact scheduler values.  This is the intended hook when the caller
 has a reference to the vLLM scheduler object (e.g. from a running engine).
 Any error in ``extra_sampler`` is silently caught (fail-open).
+
+Call :func:`register_request_progress_source` once, from the LMCache
+connector (which runs in-process with vLLM's scheduler and is constructed
+*after* this sampler), to populate ``request_progress`` on every subsequent
+heartbeat. Unlike ``extra_sampler`` this is process-global rather than
+per-``make_prometheus_queue_state_fn``-call, since the connector and the
+sampler are built at different points in the startup chain with no direct
+reference to each other. :func:`register_queued_prefill_tokens_source` is the
+same pattern, for ``queued_prefill_tokens``.
 
 Fail-open guarantee
 -------------------
@@ -67,7 +87,59 @@ ZEROS_DICT: dict = {
     "num_running": 0,
     "num_swapped": 0,
     "estimated_wait_ms": 0.0,
+    "request_progress": {},
 }
+
+# ---- Live per-request progress (registered by the connector) --------------
+
+# Set once at connector construction time via register_request_progress_source;
+# read on every heartbeat by _sample(). A plain module-level slot is enough
+# here -- unlike PrepareStore (concurrent put/pop/cancel from many requests),
+# this is a single write-once-then-read-many callback, and CPython's GIL
+# already makes a bare attribute assignment/read atomic, so no lock is needed.
+_request_progress_source: Optional[Callable[[], dict]] = None
+
+
+def register_request_progress_source(source: Callable[[], dict]) -> None:
+    """Called once by LMCacheConnectorV1 to expose live per-request progress.
+
+    *source* is a zero-argument callable returning
+    ``{pesto_request_id: num_output_tokens}`` for requests currently running
+    on this head. This bridges the connector (owns the live data, but is
+    constructed *after* this module) and the heartbeat sampler built by
+    ``create_storage_backends()`` (storage_backend/__init__.py), which has
+    no reference to the connector at construction time.
+    """
+    global _request_progress_source
+    _request_progress_source = source
+
+
+# Set once at connector construction time via
+# register_queued_prefill_tokens_source; read on every heartbeat by
+# _sample(). Same single-writer/many-reader shape as
+# _request_progress_source above, so no lock is needed here either.
+_queued_prefill_tokens_source: Optional[Callable[[], int]] = None
+
+
+def register_queued_prefill_tokens_source(source: Callable[[], int]) -> None:
+    """Called once by LMCacheConnectorV1 to expose a real prefill-token count.
+
+    *source* is a zero-argument callable returning the total number of
+    remaining (uncomputed) prefill tokens summed across requests the vLLM
+    scheduler has examined and allocated resources for. This bridges the
+    connector (owns the live per-request ``Request`` objects, but is
+    constructed *after* this module) and the heartbeat sampler, the same way
+    :func:`register_request_progress_source` does for ``request_progress``.
+
+    When no source is registered, ``queued_prefill_tokens`` falls back to
+    ``num_waiting`` (a request headcount, not a token count — see module
+    docstring). Re-registering replaces the previous source rather than
+    stacking; a raising source degrades only this one field, not the whole
+    sample.
+    """
+    global _queued_prefill_tokens_source
+    _queued_prefill_tokens_source = source
+
 
 # Maps ReportQueueState field → ordered candidate Prometheus metric-family names.
 # vLLM exposes these Gauges at /metrics (the colon prefix follows vLLM's naming
@@ -87,6 +159,13 @@ _VLLM_METRIC_CANDIDATES: dict[str, tuple[str, ...]] = {
     ),
     "num_swapped": ("vllm:num_requests_swapped",),  # V0 only; absent on V1 → 0
 }
+
+# vLLM Histogram of time spent in the WAITING phase, keyed by _sum/_count
+# samples rather than a single gauge value (see
+# _read_prometheus_histogram_mean_ms). Populated from FinishedRequestStats --
+# i.e. this is the mean over requests that have *already finished* waiting,
+# not a live estimate for the request currently being planned.
+_QUEUE_TIME_HISTOGRAM_NAME = "vllm:request_queue_time_seconds"
 
 # ---- Low-level helpers -------------------------------------------------------
 
@@ -133,6 +212,54 @@ def _read_prometheus_gauge(metric_name: str) -> Optional[float]:
         return None
 
 
+def _read_prometheus_histogram_mean_ms(metric_name: str) -> Optional[float]:
+    """Read a Histogram's _sum/_count from REGISTRY, as a mean in milliseconds.
+
+    Unlike a Gauge, a Prometheus Histogram exposes its data as ``_sum`` and
+    ``_count`` samples (plus ``_bucket`` samples this function ignores). This
+    returns ``_sum / _count`` converted from seconds to milliseconds -- the
+    mean value observed across all recorded samples so far.
+
+    Args:
+        metric_name: The Histogram's base name, e.g.
+            ``"vllm:request_queue_time_seconds"`` (without the ``_sum``/
+            ``_count`` suffix).
+
+    Returns:
+        The mean in milliseconds, or ``None`` if the metric is absent, has
+        recorded zero observations, or cannot be read for any reason.
+
+    Notes:
+        This is a lagging, historical statistic -- the mean queue time of
+        requests that have *already finished* waiting, not a live prediction
+        for the request currently being planned. Used only because vLLM does
+        not expose a live per-request queue-time forecast. Fail-open: any
+        exception returns ``None``.
+    """
+    try:
+        # Lazy import — zero cost when prometheus_client is absent.
+        from prometheus_client import REGISTRY  # type: ignore[import-untyped]
+
+        total_sum: Optional[float] = None
+        total_count: Optional[float] = None
+        for metric_family in REGISTRY.collect():
+            if metric_family.name != metric_name:
+                continue
+            for sample in metric_family.samples:
+                if sample.name == f"{metric_name}_sum":
+                    total_sum = (total_sum or 0.0) + float(sample.value)
+                elif sample.name == f"{metric_name}_count":
+                    total_count = (total_count or 0.0) + float(sample.value)
+        if total_sum is None or not total_count:
+            return None
+        return (total_sum / total_count) * 1000.0
+    except Exception as exc:
+        logger.debug(
+            "PESTO queue_stats: failed to read histogram %r: %s", metric_name, exc
+        )
+        return None
+
+
 def _collect_prometheus_stats() -> dict:
     """Read all tracked vLLM gauge metrics from the Prometheus REGISTRY.
 
@@ -154,6 +281,10 @@ def _collect_prometheus_stats() -> dict:
             result[field_name] = float(max(0.0, min(1.0, val)))
         else:
             result[field_name] = int(max(0, round(val)))
+
+    mean_wait_ms = _read_prometheus_histogram_mean_ms(_QUEUE_TIME_HISTOGRAM_NAME)
+    if mean_wait_ms is not None:
+        result["estimated_wait_ms"] = mean_wait_ms
     return result
 
 
@@ -175,11 +306,13 @@ def _collect_http_stats(metrics_url: str, timeout_s: float = 0.25) -> dict:
         return {}
 
     totals: dict[str, float] = {}
+    _queue_time_sum_name = f"{_QUEUE_TIME_HISTOGRAM_NAME}_sum"
+    _queue_time_count_name = f"{_QUEUE_TIME_HISTOGRAM_NAME}_count"
     candidate_names = {
         metric_name
         for candidates in _VLLM_METRIC_CANDIDATES.values()
         for metric_name in candidates
-    }
+    } | {_queue_time_sum_name, _queue_time_count_name}
     try:
         for line in exposition.splitlines():
             line = line.strip()
@@ -210,6 +343,11 @@ def _collect_http_stats(metrics_url: str, timeout_s: float = 0.25) -> dict:
             result[field_name] = float(max(0.0, min(1.0, value)))
         else:
             result[field_name] = int(max(0, round(value)))
+
+    queue_time_sum = totals.get(_queue_time_sum_name)
+    queue_time_count = totals.get(_queue_time_count_name)
+    if queue_time_sum is not None and queue_time_count:
+        result["estimated_wait_ms"] = (queue_time_sum / queue_time_count) * 1000.0
     return result
 
 
@@ -251,14 +389,19 @@ def make_prometheus_queue_state_fn(
         **Real** fields: ``num_waiting``, ``num_running``, ``num_swapped``,
         ``gpu_cache_usage_perc`` — sourced from the vLLM HTTP metrics endpoint
         or, as a fallback, the current process's Prometheus registry.
+        ``estimated_wait_ms`` is also real when the
+        ``vllm:request_queue_time_seconds`` histogram is present, but it's a
+        lagging historical mean (over already-finished requests), not a live
+        prediction — see :func:`_read_prometheus_histogram_mean_ms`.
 
         **Approximated** fields (GPU-free fallbacks, unless overridden via
-        ``extra_sampler``):
+        ``extra_sampler`` or, for ``queued_prefill_tokens``, a registered
+        :func:`register_queued_prefill_tokens_source`):
 
         * ``active_requests`` = ``num_running + num_waiting``
         * ``queued_prefill_tokens`` = ``num_waiting`` (lower bound)
         * ``running_decode_blocks`` = 0
-        * ``estimated_wait_ms`` = 0
+        * ``estimated_wait_ms`` = 0 (when the histogram has zero observations)
 
         Both sources are queried lazily at call time, so this function is safe
         to call before the vLLM API server is ready.
@@ -297,6 +440,38 @@ def make_prometheus_queue_state_fn(
             # scheduler access can override it explicitly.
             if "queued_prefill_tokens" not in overridden_keys:
                 result["queued_prefill_tokens"] = num_waiting
+
+            # If a real source is registered, it supersedes the num_waiting
+            # fallback above -- but never a value extra_sampler already set
+            # explicitly. A broken/raising source degrades only this field,
+            # keeping the fallback already computed, not the whole sample.
+            if (
+                "queued_prefill_tokens" not in overridden_keys
+                and _queued_prefill_tokens_source is not None
+            ):
+                try:
+                    result["queued_prefill_tokens"] = max(
+                        0, int(_queued_prefill_tokens_source())
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "PESTO queue_stats queued_prefill_tokens source error "
+                        "(non-fatal): %s",
+                        exc,
+                    )
+
+            # A broken/raising source degrades only this one field, not the
+            # whole sample -- same scoping as the extra_sampler guard above.
+            try:
+                result["request_progress"] = (
+                    _request_progress_source() if _request_progress_source else {}
+                )
+            except Exception as exc:
+                logger.debug(
+                    "PESTO queue_stats request_progress source error (non-fatal): %s",
+                    exc,
+                )
+                result["request_progress"] = {}
 
             return result
 

@@ -527,6 +527,38 @@ class LMCacheConnectorV1Impl:
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
             self._unfinished_requests: dict[str, "Request"] = {}
+
+            # PESTO: expose live per-request decode progress to the queue-state
+            # heartbeat. Lazy import -- zero cost when PESTO is disabled, same
+            # convention as the other lmcache.v1.pesto imports in this file.
+            try:
+                from lmcache.v1.pesto.queue_stats import (
+                    register_request_progress_source,
+                )
+
+                register_request_progress_source(self._snapshot_request_progress)
+            except Exception as _pesto_progress_exc:
+                logger.debug(
+                    "PESTO request-progress registration skipped (non-fatal): %s",
+                    _pesto_progress_exc,
+                )
+
+            # PESTO: expose a real queued-prefill-token count (instead of the
+            # num_waiting-based lower-bound proxy) to the queue-state
+            # heartbeat. Same lazy-import, fail-open convention as above.
+            try:
+                from lmcache.v1.pesto.queue_stats import (
+                    register_queued_prefill_tokens_source,
+                )
+
+                register_queued_prefill_tokens_source(
+                    self._snapshot_queued_prefill_tokens
+                )
+            except Exception as _pesto_prefill_exc:
+                logger.debug(
+                    "PESTO queued-prefill-tokens registration skipped (non-fatal): %s",
+                    _pesto_prefill_exc,
+                )
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
@@ -1329,6 +1361,60 @@ class LMCacheConnectorV1Impl:
     # Scheduler side APIs
     ####################
 
+    def _snapshot_request_progress(self) -> dict:
+        """PESTO: {pesto_request_id: num_output_tokens} for requests running here.
+
+        Registered once with ``queue_stats.register_request_progress_source``
+        so the PESTO heartbeat (every 2s, see ``LocationReporter``) can report
+        live per-request decode progress to GMS -- the input Arm C's oracle
+        queue estimator needs (see docs/oracle-ceiling-design.html sec 04).
+
+        ``self._unfinished_requests`` holds live references to the same
+        ``Request`` objects the scheduler mutates in place (added in
+        ``update_state_after_alloc``, popped in ``build_connector_meta`` on
+        finish), so ``request.num_output_tokens`` here reflects true current
+        progress, not a stale snapshot. Requests without a resolvable
+        ``pesto_request_id`` (not routed through the PESTO gateway, or
+        internal/mock requests) are skipped, not reported as 0.
+        """
+        out: dict[str, int] = {}
+        for request in self._unfinished_requests.values():
+            sp = getattr(request, "sampling_params", None)
+            extra_args = getattr(sp, "extra_args", None) if sp is not None else None
+            pesto_id = extra_args.get("pesto_request_id") if extra_args else None
+            if pesto_id:
+                out[pesto_id] = request.num_output_tokens
+        return out
+
+    def _snapshot_queued_prefill_tokens(self) -> int:
+        """PESTO: total remaining (uncomputed) prefill tokens across requests
+        the scheduler has examined and allocated for.
+
+        Registered once with
+        ``queue_stats.register_queued_prefill_tokens_source`` so the PESTO
+        heartbeat can report a real token count instead of the
+        num_waiting-based lower-bound proxy (each waiting request counted as
+        exactly one pending token).
+
+        Known limitation: a request only enters ``self._unfinished_requests``
+        once the scheduler's admission loop
+        (``Scheduler.schedule()``'s ``while self.waiting and token_budget >
+        0``) has dequeued and allocated it via ``update_state_after_alloc``.
+        Requests still buried behind that loop's early exit (token budget or
+        max_num_running_reqs exhausted) are invisible here -- same blind spot
+        as ``num_waiting`` today, but this still counts real remaining
+        prefill tokens for every request the scheduler *has* looked at,
+        rather than assuming exactly one token per waiting request. A fully
+        complete value would need a live ``Scheduler`` reference, which the
+        KVConnectorV1 API does not expose to connectors.
+        """
+        total = 0
+        for request in self._unfinished_requests.values():
+            remaining = request.num_prompt_tokens - request.num_computed_tokens
+            if remaining > 0:
+                total += remaining
+        return total
+
     @_lmcache_nvtx_annotate
     def get_num_new_matched_tokens(
         self,
@@ -1862,7 +1948,7 @@ class LMCacheConnectorV1Impl:
             self, "_layerwise_save_storers"
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
-
+        '''
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED:
             # Notify storage backends of aborted requests
@@ -1876,6 +1962,27 @@ class LMCacheConnectorV1Impl:
                 lookup_id = request.request_id
                 assert self.lookup_client is not None
                 self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
+        '''
+        # Cleanup if request was aborted
+        if request.status == RequestStatus.FINISHED_ABORTED:
+            if self.lmcache_engine is None:
+                logger.warning(
+                    "request_finished: request %s aborted before "
+                    "lmcache_engine was attached; skipping LMCache "
+                    "cleanup for this request.",
+                    request.request_id,
+                )
+            else:
+                # Notify storage backends of aborted requests
+                sm = self.lmcache_engine.storage_manager
+                if sm is not None:
+                    sm.cancel_request(request.request_id)
+
+                if self.async_loading:
+                    # Cancel any ongoing async lookup and prefetch tasks on workers
+                    lookup_id = request.request_id
+                    assert self.lookup_client is not None
+                    self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
 
         params = (
             request.kv_transfer_params

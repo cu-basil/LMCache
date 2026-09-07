@@ -295,19 +295,12 @@ def CreateStorageBackends(
                         _reporter = LocationReporter(
                             client=_gms_client,
                             head_id=_identity.head_id,
-                            namespace=_identity.namespace,
-                            tokenizer_id=_identity.tokenizer_id,
-                            chat_template_id=_identity.chat_template_id,
-                            holder_ttl_ms=int(
-                                _ec.get("pesto_local_holder_ttl_ms", 5000)
-                            ),
                             endpoint=_identity.endpoint,
                             get_queue_state_fn=_get_queue_state_fn,
                         )
                         _reporter.start(loop)
-                        local_cpu_backend._pesto_reporter = _reporter
                         logger.info(
-                            "PESTO LocationReporter injected — head_id=%s namespace=%s",
+                            "PESTO LocationReporter started — head_id=%s namespace=%s",
                             _identity.head_id,
                             _identity.namespace,
                         )

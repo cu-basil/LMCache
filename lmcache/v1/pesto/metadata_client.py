@@ -28,18 +28,13 @@ from lmcache.logging import init_logger
 
 # Local
 from pesto_gms.api_models import (
-    BatchedLookupRequest,
-    BatchedLookupResponse,
     CommitRemoteWrite,
     Heartbeat,
     HeartbeatResponse,
     ReportAccess,
     ReportBlockLocation,
-    ReportLocationEvict,
     ReportPrefetchOutcome,
     ReportQueueState,
-    ReserveRemoteWrite,
-    ReserveRemoteWriteResponse,
 )
 
 logger = init_logger(__name__)
@@ -170,37 +165,12 @@ class GmsMetadataClient:
             req.model_dump(),
         )
 
-    async def report_location_evict(self, req: ReportLocationEvict) -> None:
-        """Notify GMS that blocks were evicted from a tier (fire-and-forget)."""
-        await self._post(
-            "/api/v1/report/location-evict",
-            req.model_dump(),
-        )
-
     async def report_prefetch_outcome(self, req: ReportPrefetchOutcome) -> None:
         """Report prefetch outcomes for a completed plan (fire-and-forget)."""
         await self._post(
             "/api/v1/report/prefetch-outcome",
             req.model_dump(),
         )
-
-    async def reserve_remote_write(
-        self, req: ReserveRemoteWrite
-    ) -> Optional[ReserveRemoteWriteResponse]:
-        """Request admission before uploading a block to MinIO.
-
-        Returns:
-            A ``ReserveRemoteWriteResponse`` on success, or ``None`` on error
-            (caller should fall back to a plain PUT).
-        """
-        raw = await self._post("/api/v1/write/reserve", req.model_dump())
-        if raw is None:
-            return None
-        try:
-            return ReserveRemoteWriteResponse.model_validate(raw)
-        except Exception as exc:
-            logger.warning("Failed to parse ReserveRemoteWriteResponse: %s", exc)
-            return None
 
     async def commit_remote_write(self, req: CommitRemoteWrite) -> None:
         """Confirm a completed MinIO upload against a reservation (fire-and-forget)."""
@@ -229,24 +199,6 @@ class GmsMetadataClient:
             return HeartbeatResponse.model_validate(raw)
         except Exception as exc:
             logger.warning("Failed to parse HeartbeatResponse: %s", exc)
-            return None
-
-    async def batched_lookup(
-        self, req: BatchedLookupRequest
-    ) -> Optional[BatchedLookupResponse]:
-        """Look up all known locations for a batch of block keys.
-
-        Returns:
-            A ``BatchedLookupResponse`` on success, or ``None`` on error
-            (caller should fall back to normal cache lookup).
-        """
-        raw = await self._post("/api/v1/blocks/batched-lookup", req.model_dump())
-        if raw is None:
-            return None
-        try:
-            return BatchedLookupResponse.model_validate(raw)
-        except Exception as exc:
-            logger.warning("Failed to parse BatchedLookupResponse: %s", exc)
             return None
 
     async def close(self) -> None:

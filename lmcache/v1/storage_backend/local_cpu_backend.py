@@ -103,14 +103,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self._setup_metrics()
 
-        # ── PESTO Patch Point 5 ───────────────────────────────────────────────
-        # Optional LocationReporter injected by the factory when pesto_enabled.
-        # Typed as Any to avoid a hard import of the pesto subpackage here;
-        # the reporter exposes enqueue_put(key_str, tier) and
-        # enqueue_evict(key_str, tier) which are fire-and-forget (no blocking).
-        self._pesto_reporter: Optional[Any] = None
-        # ── end PESTO patch ───────────────────────────────────────────────────
-
     def _setup_metrics(self) -> None:
         if self.metadata is None:
             return
@@ -188,14 +180,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 on_complete_callback(key)
             except Exception as e:
                 logger.warning(f"on_complete_callback failed for key {key}: {e}")
-
-        # ── PESTO Patch Point 5: report insertion to GMS (non-blocking) ──────
-        if stored and self._pesto_reporter is not None:
-            try:
-                self._pesto_reporter.enqueue_put(key.to_string(), "local_cpu")
-            except Exception:
-                pass
-        # ── end PESTO patch ────────────────────────────────────────────────────
 
         return None
 
@@ -304,13 +288,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 op_type=OpType.EVICT,
                 key=key.chunk_hash,
             )
-        # ── PESTO Patch Point 5: report eviction to GMS (non-blocking) ───────
-        if self._pesto_reporter is not None:
-            try:
-                self._pesto_reporter.enqueue_evict(key.to_string(), "local_cpu")
-            except Exception:
-                pass
-        # ── end PESTO patch ────────────────────────────────────────────────────
         # NOTE (Jiayi): This `return True` might not accurately reflect
         # whether the key is removed from the actual memory because
         # other backends might still (temporarily) hold the memory object.

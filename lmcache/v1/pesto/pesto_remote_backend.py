@@ -53,7 +53,7 @@ def _key_to_block_key(
 ) -> "Optional[Any]":
     """Translate a CacheEngineKey to a pesto_gms BlockKey. Returns None on error."""
     try:
-        from pesto_gms.keys import cache_engine_string_to_block_key
+        from pesto_gms.schemas import cache_engine_string_to_block_key
 
         return cache_engine_string_to_block_key(
             key.to_string(), namespace, tokenizer_id, chat_template_id
@@ -108,7 +108,7 @@ class PestoRemoteBackend(RemoteBackend):
         try:
             self._gms: Optional[GmsMetadataClient] = create_gms_client(config)
             # Verify deterministic hashing at startup
-            from pesto_gms.keys import assert_deterministic_hashing
+            from pesto_gms.schemas import assert_deterministic_hashing
 
             assert_deterministic_hashing(config.pre_caching_hash_algorithm)
             logger.info(
@@ -304,6 +304,6 @@ class PestoRemoteBackend(RemoteBackend):
     @staticmethod
     def assert_deterministic_hashing(algo: str) -> None:
         """Verify hash algorithm determinism. Raises ``ValueError`` if not sha256."""
-        from pesto_gms.keys import assert_deterministic_hashing
+        from pesto_gms.schemas import assert_deterministic_hashing
 
         assert_deterministic_hashing(algo)

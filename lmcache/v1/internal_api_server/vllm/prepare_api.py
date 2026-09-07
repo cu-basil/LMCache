@@ -97,8 +97,11 @@ def _stage_blocks_background_sync(
         sm: The LMCache storage manager (exposes a synchronous ``get(key)`` API).
         prep_req: The validated :class:`~pesto_gms.api_models.PrepareRequest`.
         this_head_id: Resolved head id for peer-source filtering.
-        deadline_epoch_s: Wall-clock deadline (``time.time()`` epoch seconds).
-            Staging stops when ``time.time() >= deadline_epoch_s``.
+        deadline_epoch_s: Request-level fallback wall-clock deadline
+            (``time.time()`` epoch seconds), used for any action whose own
+            ``deadline_ms`` is unset (``<= 0``). Each action's own
+            ``deadline_ms`` (set by the active GMS PrefetchPolicy), when
+            present, takes precedence — see the per-action check below.
         budget_bytes: Maximum bytes to stage (0 = unlimited).
     """
     reserved_bytes: int = 0
@@ -108,16 +111,27 @@ def _stage_blocks_background_sync(
         if action.action in ("local_hit", "recompute"):
             continue
 
-        # Respect the deadline.
-        if deadline_epoch_s > 0 and time.time() >= deadline_epoch_s:
+        # Respect the deadline — the action's own (policy-computed) deadline
+        # takes precedence over the request-level default. Skip only this
+        # action (not the whole batch): deadlines are per-block, so one
+        # expired block must not prevent staging a later block whose own
+        # deadline hasn't passed.
+        action_deadline_epoch_s = (
+            action.deadline_ms / 1000.0  # type: ignore[attr-defined]
+            if action.deadline_ms > 0  # type: ignore[attr-defined]
+            else deadline_epoch_s
+        )
+        if action_deadline_epoch_s > 0 and time.time() >= action_deadline_epoch_s:
             logger.debug(
-                "PESTO prepare bg: deadline exceeded for request_id=%s after %d bytes",
+                "PESTO prepare bg: deadline exceeded for one block, skipping "
+                "request_id=%s after %d bytes",
                 prep_req.request_id,  # type: ignore[attr-defined]
                 reserved_bytes,
             )
-            break
+            continue
 
-        # Respect the local budget.
+        # Respect the local budget — a real shared resource limit for the
+        # whole request, so exhausting it still stops the entire batch.
         if budget_bytes > 0 and reserved_bytes >= budget_bytes:
             logger.debug(
                 "PESTO prepare bg: budget_bytes=%d reached for request_id=%s",
@@ -156,7 +170,7 @@ def _stage_blocks_background_sync(
 
         # Parse key and fetch — direct synchronous call (in thread-pool worker).
         try:
-            from pesto_gms.keys import block_key_to_cache_engine_string  # noqa: PLC0415
+            from pesto_gms.schemas import block_key_to_cache_engine_string  # noqa: PLC0415
 
             key_str = block_key_to_cache_engine_string(action.block_key)
             key = parse_cache_key(key_str)
